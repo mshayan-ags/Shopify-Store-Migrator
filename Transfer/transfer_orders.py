@@ -1,27 +1,3 @@
-"""Transfer historical orders from Src to dest.
-
-Requires the `read_orders`/`write_orders` scope (already granted). Reading
-orders beyond the default 60-day window, or any customer PII embedded on them
-(email/phone/addresses), may also require Shopify's "Protected customer data"
-access approval for the app — if requests fail with a protected-data error,
-that has to be requested from Shopify first.
-
-IMPORTANT: this creates real Order records on the destination store via the
-`orderCreate` mutation. No payment is actually processed — historical orders
-are recorded with a manual "already paid" transaction reflecting what was
-collected on Src, exactly as Shopify's own migration tooling does. This
-is financial/accounting data: dry-run the export and review
-Results/orders_export_*.json BEFORE running with --execute.
-
-Run transfer_products.py (--all) and transfer_customers.py first, since line
-items are matched to destination variants by SKU and orders are associated to
-destination customers by email.
-
-Usage:
-    python transfer_orders.py                # dry-run export
-    python transfer_orders.py --execute       # create orders on dest
-    python transfer_orders.py --execute --limit 5   # test with a handful first
-"""
 import argparse
 import json
 import logging
@@ -33,14 +9,15 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
-from Transfer.transfer_store_metafields import retry_with_backoff, set_metafields, gql_quote
+from transfer.transfer_product import make_client
+from transfer.transfer_store_metafields import retry_with_backoff, set_metafields, gql_quote
 from utils.shopify_graphql_utils import paginate_connection, export_metafields, mutation_errors, run_concurrently, DEFAULT_WORKERS
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_orders")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 ADDRESS_FIELDS = "address1 address2 city company countryCodeV2 firstName lastName phone provinceCode zip"
@@ -214,8 +191,6 @@ def export_orders(src_client, limit: Optional[int] = None) -> List[Dict[str, Any
 
 
 def build_dest_variant_sku_index(dest_client) -> Dict[str, str]:
-    """SKU -> destination ProductVariant GID, across the whole store."""
-
     def build_query(after_clause: str) -> str:
         return f"""
         {{
@@ -251,8 +226,6 @@ def address_input_literal(address: Optional[Dict[str, Any]]) -> Optional[str]:
         if not value:
             continue
         if input_key == "countryCode":
-            # CountryCode is a GraphQL enum on MailingAddressInput -- must be a bare
-            # literal (US), not a quoted string ("US"), or the mutation is rejected.
             fields.append(f"{input_key}: {value}")
         else:
             fields.append(f"{input_key}: {gql_quote(value)}")
@@ -320,9 +293,6 @@ def build_tax_lines_literal(tax_lines: List[Dict[str, Any]]) -> Optional[str]:
 def build_custom_attributes_literal(order: Dict[str, Any]) -> Optional[str]:
     attrs = list(order.get("custom_attributes") or [])
     if order.get("discount_codes"):
-        # Order.discountCodes only exposes the code text, not its type/value, so it
-        # can't be reconstructed as a real OrderCreateDiscountCodeInput. Preserve it
-        # as an attribute instead of guessing at (and misrepresenting) the discount.
         attrs.append({"key": "original_discount_codes", "value": ", ".join(order["discount_codes"])})
     if not attrs:
         return None
@@ -349,18 +319,6 @@ def build_transaction_literal(txn: Dict[str, Any]) -> Optional[str]:
 def import_orders(
     dest_client, exported: List[Dict[str, Any]], replace_existing: bool = False, max_workers: int = DEFAULT_WORKERS
 ) -> None:
-    """Create each exported order on the destination, up to max_workers concurrently.
-
-    By default, an order whose name already exists on the destination is left
-    alone and skipped. With replace_existing=True, it's deleted and recreated
-    instead -- use this after enhancing what fields get captured/set, so
-    orders created by an earlier, thinner version of this script get the full
-    detail set too.
-
-    existing_by_name is built once up front and only ever read (never mutated)
-    inside process_order, so concurrent workers can't race on it -- each order
-    is independent, matched/created by its own unique name.
-    """
     variant_index = build_dest_variant_sku_index(dest_client)
     existing_by_name = {o["name"]: o["id"] for o in fetch_all_orders(dest_client)}
 
@@ -392,10 +350,6 @@ def import_orders(
         tags_literal = "[" + ", ".join(gql_quote(t) for t in order.get("tags", [])) + "]"
 
         fields = [
-            # Without an explicit name, Shopify assigns the destination's own next
-            # sequential order number instead of preserving the source's -- which
-            # also breaks the "does this order already exist" dedup check above,
-            # since it can never match a destination-assigned name to a source one.
             f"name: {gql_quote(order['name'])}",
             f"email: {gql_quote(order.get('email'))}",
             f"currency: {order.get('currency') or 'USD'}",
@@ -424,10 +378,6 @@ def import_orders(
             fields.append("transactions: [" + ", ".join(transactions) + "]")
         if order.get("po_number"):
             fields.append(f"poNumber: {gql_quote(order['po_number'])}")
-        # sourceName is intentionally not set here: Shopify rejects most real
-        # values (e.g. "web") as "protected values" that untrusted/custom API
-        # clients can't assign -- the source_name is still preserved in the
-        # export JSON, just not replayed on creation.
         if order.get("closed_at"):
             fields.append(f"closedAt: {gql_quote(order['closed_at'])}")
         shipping_lines = build_shipping_lines_literal(order.get("shipping_line"))
@@ -452,9 +402,6 @@ def import_orders(
         try:
             result = retry_with_backoff(lambda: dest_client.mutation(mutation))
         except Exception as e:
-            # A hard GraphQL error (bad enum literal, malformed input, etc.) raises
-            # here instead of populating userErrors -- skip just this order rather
-            # than losing the rest of the run.
             logger.warning("Failed to create order %s: %s", order["name"], e)
             record("failed")
             return
@@ -511,6 +458,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Transfer historical orders from Src to dest")
     parser.add_argument("--execute", action="store_true", help="Create orders on the destination store")
     parser.add_argument("--out", default="Results", help="Output directory for the export JSON")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
     parser.add_argument("--limit", type=int, default=None, help="Only transfer the first N orders (oldest first)")
     parser.add_argument(
         "--replace-existing",
@@ -523,32 +471,52 @@ def main() -> None:
         default=DEFAULT_WORKERS,
         help=f"Number of orders to import concurrently (default {DEFAULT_WORKERS}; 1 = sequential)",
     )
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed in "
+            "this mode."
+        ),
+    )
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
 
-    logger.info("Exporting orders from %s", src_shop)
-    exported = export_orders(src_client, limit=args.limit)
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            exported = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+    else:
+        src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+        src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+        require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
 
-    ts = int(time.time())
-    out_file = out_dir / f"orders_export_{ts}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(exported, f, indent=2, ensure_ascii=False)
-    logger.info("Export complete: %s -- REVIEW THIS FILE before running --execute", out_file)
+        src_client = make_client(src_shop, src_token)
+
+        logger.info("Exporting orders from %s", src_shop)
+        exported = export_orders(src_client, limit=args.limit)
+
+        ts = int(time.time())
+        out_file = out_dir / f"orders_export_{ts}.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(exported, f, indent=2, ensure_ascii=False)
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported, out_dir / f"orders_export_{ts}.xlsx")
+        logger.info("Export complete: %s -- REVIEW THIS FILE before running --execute", out_file)
 
     if args.execute:
         logger.info("Importing orders into %s", dest_shop)
