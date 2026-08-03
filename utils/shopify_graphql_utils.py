@@ -1,16 +1,9 @@
-"""Shared GraphQL helpers for the Src -> dest content-transfer scripts."""
 from typing import Any, Callable, Dict, List, Tuple
 
 from utils.shopify_client import ShopifyClient
-from Transfer.transfer_store_metafields import retry_with_backoff, gql_quote
+from transfer.transfer_store_metafields import retry_with_backoff, gql_quote
 
-# Re-exported for scripts that already import these from here; the canonical
-# definitions live in concurrency_utils.py (which has zero project-internal
-# imports) to avoid an import cycle -- transfer_collections.py is imported by
-# transfer_store_metafields.py, which this module also imports, so
-# transfer_collections.py can't import run_concurrently from here without
-# forming a cycle back to itself.
-from utils.concurrency_utils import run_concurrently, DEFAULT_WORKERS  # noqa: F401
+from utils.concurrency_utils import run_concurrently, DEFAULT_WORKERS
 
 
 def paginate_connection(
@@ -18,12 +11,6 @@ def paginate_connection(
     build_query: Callable[[str], str],
     connection_path: Tuple[str, ...],
 ) -> List[Dict[str, Any]]:
-    """Walk a cursor-paginated GraphQL connection, returning every node.
-
-    `build_query(after_clause)` must return a full query string with `after_clause`
-    spliced into the connection's argument list (e.g. `(first: 100{after_clause})`).
-    `after_clause` is either "" for the first page or `, after: "<cursor>"` afterward.
-    """
     nodes: List[Dict[str, Any]] = []
     after_clause = ""
 
@@ -46,7 +33,6 @@ def paginate_connection(
 
 
 def export_metafields(node_metafields_connection: Dict[str, Any]) -> List[Dict[str, Any]]:
-    """Flatten a `metafields(first: N) { edges { node { ... } } }` selection into plain dicts."""
     return [
         {
             "namespace": edge["node"]["namespace"],
