@@ -1,105 +1,3 @@
-"""Transfer online store theme code from Src to dest.
-
-Copies every file (Liquid templates/sections/snippets, JSON templates/config,
-assets, locales) from a source theme into a brand-new theme on the destination
-store, using the Admin GraphQL theme file APIs (`theme`, `themeFilesUpsert`)
-rather than the Shopify CLI.
-
-IMPORTANT -- this needs more than a scope toggle:
-    `write_themes` must be granted on both stores' custom apps AND, per
-    Shopify's own docs, theme file read/write additionally requires "an
-    exemption from Shopify to modify themes" -- a separate approval Shopify
-    grants to apps, on top of the access scope. Until that exemption is
-    granted for this custom app on both stores, themeCreate/themeFilesUpsert
-    calls will fail even with the scope present. If this script errors with
-    an access/permission message, that -- not a missing scope -- is almost
-    certainly why; contact Shopify support/Partner Dashboard to request it.
-
-How theme creation actually works here:
-    The Admin API has no "create an empty theme" mutation -- `themeCreate`
-    requires a `source` (a URL to a theme .zip). By default this script builds
-    a tiny placeholder theme zip in memory and uploads it through Shopify's own
-    staged-upload pipeline (`stagedUploadsCreate` -> POST the bytes -> pass the
-    resulting resourceUrl as `source`), then immediately overwrites every file
-    with the source theme's real files via `themeFilesUpsert`. The placeholder
-    content never actually ends up live -- it only exists so there's a theme ID
-    to upsert real files into.
-
-    Earlier versions of this script pointed `source` at a public GitHub zip
-    URL instead -- don't go back to that. Verified live: both GitHub's
-    `codeload.github.com` archive endpoint (no Content-Length header, chunked
-    encoding) and its release-asset download (redirects to a short-lived
-    signed URL) get rejected by themeCreate with "Src is empty", even though
-    both were genuinely fetchable with curl -- Shopify's fetcher doesn't
-    tolerate whatever it is about those responses. The staged-upload path
-    sidesteps this entirely since Shopify is serving its own upload back to
-    itself. Pass --seed-zip only if you have a URL you've already confirmed
-    themeCreate accepts.
-
-    Non-text files (images, fonts, video) are downloaded locally and
-    re-uploaded as base64; text files (Liquid/JSON/CSS/JS/locale files) are
-    copied inline. Batches are capped at 50 files per themeFilesUpsert call,
-    matching Shopify's documented per-request limit.
-
-Images referenced by the theme, not just theme package files:
-    A theme's own asset folder isn't the only place images live. Confirmed
-    against a live export of Src's theme: its settings_data.json and
-    JSON templates reference 775 distinct images from Content > Files (the
-    shop's general media library) -- 249 via `shopify://shop_images/<filename>`
-    (banners/logos/section images picked in the theme customizer) and 552+ via
-    a hardcoded absolute CDN URL (`cdn.shopify.com/s/files/.../files/<filename>`
-    or a custom domain's `/cdn/shop/files/<filename>` proxy path). Neither is
-    part of the theme's file bundle, so without handling them separately the
-    imported theme would render with broken images everywhere despite every
-    theme file copying successfully.
-
-    This script handles both automatically on --execute:
-      1. Scans every text theme file for both reference patterns.
-      2. Indexes the source AND destination Content > Files libraries (only
-         once, not per-reference) and creates on the destination whichever
-         referenced files don't already exist there, via `fileCreate` --
-         verified live: source CDN URLs are fetched directly by Shopify
-         (`originalSource` accepts an external URL, no local download/staged
-         upload needed), and polls each new file until `fileStatus: READY` to
-         get its destination URL.
-      3. `shopify://shop_images/<filename>` references need no rewriting --
-         Shopify resolves those dynamically against the destination's own
-         Files library by filename match at render time, once the same-named
-         file exists there. Hardcoded absolute CDN URLs DO need rewriting
-         (they point at the source store's specific shop path/domain, which
-         won't resolve on the destination even with a same-named file
-         present) -- rewritten in place before the theme files are uploaded.
-    This only covers images actually referenced in the theme's own files --
-    it does not sync the store's entire (possibly much larger) Files library,
-    which would include lots of unused/orphaned uploads outside the theme's
-    scope.
-
-The new theme is created with role UNPUBLISHED by default -- it will NOT go
-live automatically. Pass --publish to make it the live theme immediately;
-that's a customer-facing, hard-to-silently-undo action, so it's opt-in only.
-
-Not handled by this script:
-    - Theme app-embed blocks/settings that reference a specific app's ID
-      (those app IDs differ across stores; blocks tied to an app not
-      installed on the destination will silently no-op there).
-    - Theme editor customizations stored against a *different* theme than
-      the one exported (e.g. draft/unpublished alternate themes) -- run this
-      once per theme you want copied, passing --theme-id explicitly.
-    - Metafields/settings_data.json values that reference product/collection/
-      page/blog/metaobject IDs from the source store -- those IDs won't
-      resolve on the destination and need manual remapping in the theme
-      editor after import.
-    - Video/3D model files referenced the same way as images (rare) -- only
-      IMAGE and generic FILE content types are synced; extend
-      fetch_shop_files_index's inline fragments to cover Video/Model3d if
-      those turn out to matter for this theme.
-
-Usage:
-    python transfer_theme.py                      # dry-run export of the published theme
-    python transfer_theme.py --execute             # create the theme on dest (unpublished)
-    python transfer_theme.py --execute --publish   # create AND publish it live
-    python transfer_theme.py --theme-id gid://shopify/OnlineStoreTheme/123 --execute
-"""
 import argparse
 import base64
 import io
@@ -116,15 +14,16 @@ from urllib.parse import urlparse
 import requests
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
-from Transfer.transfer_collections import download_image
+from transfer.transfer_product import make_client
+from transfer.transfer_collections import download_image
 from utils.shopify_graphql_utils import paginate_connection, mutation_errors
 from utils.concurrency_utils import retry_with_backoff, gql_quote
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_theme")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 MAX_FILES_PER_UPSERT = 50
 MAX_FILES_PER_CREATE = 20
@@ -132,14 +31,6 @@ MAX_NODES_PER_QUERY = 250
 FILE_POLL_ATTEMPTS = 20
 FILE_POLL_DELAY = 2.0
 
-# Theme JSON/Liquid content references images picked in Content > Files two ways:
-#   1. shopify://shop_images/<filename> -- resolved dynamically by filename against
-#      the destination's own Files library, so it needs no rewriting as long as a
-#      file with the same filename exists there.
-#   2. An absolute CDN URL baked directly into the content (cdn.shopify.com/s/files/...
-#      or a custom domain's /cdn/shop/files/... proxy path) -- this hardcodes the
-#      SOURCE store's shop path/domain and will 404 on the destination even if a
-#      same-named file exists there, so these need rewriting to the new absolute URL.
 FILENAME_CHARS = r"[A-Za-z0-9_.\-%]+"
 SHOP_IMAGES_RE = re.compile(r"shopify://shop_images/(" + FILENAME_CHARS + ")")
 CDN_ABSOLUTE_RE = re.compile(
@@ -154,7 +45,6 @@ def chunk(items: List[Any], size: int) -> List[List[Any]]:
 
 
 def find_referenced_filenames(files: List[Dict[str, Any]]) -> Set[str]:
-    """Scan every text theme file for Content > Files image/file references."""
     names: Set[str] = set()
     for f in files:
         if f.get("kind") != "text":
@@ -166,8 +56,6 @@ def find_referenced_filenames(files: List[Dict[str, Any]]) -> Set[str]:
 
 
 def fetch_shop_files_index(client) -> Dict[str, Dict[str, Any]]:
-    """Return {filename: {url, alt, content_type}} for every file in Content > Files."""
-
     def build_query(after_clause: str) -> str:
         return f"""
         query {{
@@ -210,13 +98,6 @@ def sync_referenced_files(
     src_index: Optional[Dict[str, Dict[str, Any]]] = None,
     dest_index: Optional[Dict[str, Dict[str, Any]]] = None,
 ) -> Dict[str, str]:
-    """Ensure every Content > Files image/file the theme references also exists on
-    the destination, and return {filename: destination_absolute_url} for rewriting.
-
-    src_index/dest_index can be pre-fetched and passed in (and are mutated in
-    place with newly-created entries) so a multi-theme run only indexes each
-    store's Files library once instead of once per theme.
-    """
     if not filenames:
         return {}
 
@@ -317,10 +198,6 @@ def sync_referenced_files(
 
 
 def rewrite_cdn_references(files: List[Dict[str, Any]], filename_to_new_url: Dict[str, str]) -> int:
-    """Replace hardcoded source-store CDN URLs in theme text files with the
-    matching destination URL. shopify://shop_images/ references need no rewrite --
-    they resolve by filename against the destination's Files library at render time.
-    """
     if not filename_to_new_url:
         return 0
 
@@ -366,12 +243,6 @@ def find_theme_id(client, role: str = "MAIN") -> Dict[str, str]:
 
 
 def fetch_theme_filenames_only(client, theme_id: str) -> Set[str]:
-    """Cheap filename-only pagination -- used as a completeness cross-check
-    against the body-content fetch, which was confirmed live to silently drop
-    files entirely (no error, node just doesn't appear in the connection) when
-    a file's body can't be resolved for some Shopify-side reason.
-    """
-
     def build_query(after_clause: str) -> str:
         return f"""
         query {{
@@ -415,16 +286,6 @@ def fetch_one_theme_file_with_body(client, theme_id: str, filename: str) -> Opti
 
 
 def recover_silently_dropped_files(client, theme_id: str, nodes: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
-    """Cross-check the body-content fetch against a cheap filename-only fetch
-    and try to individually recover anything missing. Confirmed live: this
-    genuinely happens (2 files on a real Src theme, both present in the
-    filename-only list, silently absent whenever body content was requested,
-    even via a single-file filtered lookup) -- not a pagination fluke, and not
-    fixable by changing page size (tested 10/20/50/100, same 2 files missing
-    every time). When even the single-file retry comes back empty, the file
-    truly can't be read via this API right now; it's logged clearly so it can
-    be recreated by hand rather than silently missing from the destination.
-    """
     all_filenames = fetch_theme_filenames_only(client, theme_id)
     fetched_filenames = {n["filename"] for n in nodes}
     missing = sorted(all_filenames - fetched_filenames)
@@ -529,9 +390,6 @@ def export_theme(client, theme_id: Optional[str], role: str, out_dir: Path) -> D
 
 
 def build_placeholder_theme_zip() -> bytes:
-    """A minimal valid theme structure -- its content is irrelevant since every
-    file gets overwritten by upsert_files() immediately after theme creation.
-    """
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
         zf.writestr("layout/theme.liquid", "<html><body>{{ content_for_layout }}</body></html>")
@@ -540,13 +398,6 @@ def build_placeholder_theme_zip() -> bytes:
 
 
 def stage_upload(dest_client, filename: str, mime_type: str, content: bytes) -> str:
-    """Upload bytes to Shopify's own staged-upload storage and return a resourceUrl
-    themeCreate can use as `source`. Verified live: this is far more reliable than
-    passing an external URL -- GitHub's codeload zip endpoint has no Content-Length
-    header (chunked encoding) and its release-asset download redirects to a
-    short-lived signed URL, and Shopify's themeCreate fetcher rejected both with
-    "Src is empty" even though the URLs were genuinely fetchable by curl.
-    """
     mutation = f"""
     mutation {{
       stagedUploadsCreate(input: [{{
@@ -609,10 +460,6 @@ def build_file_input(f: Dict[str, Any]) -> Optional[str]:
 
 
 def try_upsert_batch(dest_client, theme_id: str, batch: List[Dict[str, Any]]) -> Optional[Any]:
-    """Attempt one themeFilesUpsert call. Returns the raw userErrors list on a
-    GraphQL-level failure (empty list means success), or None if the whole
-    request failed to execute (network/transport error).
-    """
     file_inputs = [inp for inp in (build_file_input(f) for f in batch) if inp]
     if not file_inputs:
         return []
@@ -635,16 +482,6 @@ def try_upsert_batch(dest_client, theme_id: str, batch: List[Dict[str, Any]]) ->
 
 
 def upsert_files_pass(dest_client, theme_id: str, files: List[Dict[str, Any]], uploaded: Set[str]) -> None:
-    """Upload files in batches, adding each successfully-upserted filename to
-    `uploaded`. A batch that fails (transport error or userErrors -- either can
-    come from a single bad file poisoning the whole batch, e.g. a malformed
-    unicode escape, or a file uploaded out of order relative to something it
-    references, e.g. a section referenced before its file exists) is bisected
-    and retried as smaller batches so one bad/out-of-order file can't also
-    fail its ~49 good batch-mates. Isolates down to individual files only when
-    truly necessary.
-    """
-
     def process(batch: List[Dict[str, Any]]) -> None:
         if not batch:
             return
@@ -739,33 +576,10 @@ def import_theme(
         logger.info("Theme left UNPUBLISHED. Re-run with --publish (or publish manually) to make it live.")
 
 
-STANDARD_PLAN_THEME_LIMIT = 20  # Shopify Plus allows 100; both stores here are confirmed non-Plus.
+STANDARD_PLAN_THEME_LIMIT = 20
 
 
 def transfer_all_themes(src_client, dest_client, out_dir: Path, publish_main: bool = False, theme_limit: int = STANDARD_PLAN_THEME_LIMIT) -> None:
-    """Export and import every theme on the source store in one run.
-
-    Each theme becomes its own new UNPUBLISHED theme on the destination (only
-    the source's MAIN theme is optionally published, via publish_main -- every
-    other role, e.g. UNPUBLISHED/DEVELOPMENT drafts, is never auto-published
-    regardless of this flag). The Content > Files library is indexed once and
-    shared across every theme's file sync instead of once per theme -- that
-    indexing pass was the slow part in testing (hundreds of files), and a
-    store's file library doesn't change mid-run, so re-indexing it per theme
-    would be pure waste. A file referenced by more than one theme is created on
-    the destination only once and reused for every later theme in the run.
-
-    Standard (non-Plus) Shopify plans cap a store at 20 themes total; Plus
-    allows 100 (theme_limit lets a Plus store override this). This checks the
-    destination's current theme count up front and, if there isn't room for
-    every source theme, transfers as many as fit -- MAIN first, since that's
-    the one that actually matters most -- and logs exactly which ones were
-    skipped for capacity rather than silently dropping them or failing
-    partway through the run.
-
-    A single theme's export or import failing is logged and does not stop the
-    rest of the run, matching transfer_all.py's per-step failure handling.
-    """
     themes = fetch_all_themes(src_client)
     logger.info("Found %s theme(s) on the source store", len(themes))
 
@@ -849,23 +663,52 @@ def main() -> None:
     parser.add_argument("--seed-zip", default=None, help="Override: a theme zip URL to seed the destination theme from, instead of the built-in placeholder")
     parser.add_argument("--publish", action="store_true", help="Publish live after import -- with --all, only the source's MAIN theme is published; other roles never are")
     parser.add_argument("--out", default="Results", help="Output directory for the export")
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import a single previously-saved theme export JSON file "
+            "instead (the shape produced by this script's own dry-run export -- see "
+            "docs/CANONICAL_SCHEMA.md). Lets you replay a prior dry-run export, or import a theme bundle "
+            "produced by some other means, without a live source Shopify store -- no SRC_SHOPIFY_* "
+            "credentials needed in this mode. LIMITATION: Content > Files image/reference syncing "
+            "(shopify://shop_images/ and hardcoded source-CDN URLs) is skipped entirely, since resolving "
+            "those requires a live query against the source store's Files library -- such references will "
+            "be broken on the destination until fixed up manually. Binary theme files are read from the "
+            "'local_path' the original export wrote to disk, so that local theme_assets folder must still "
+            "be present alongside the JSON file. Not compatible with --all."
+        ),
+    )
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
+
+    if args.import_from:
+        if args.all:
+            raise RuntimeError("--import-from is not compatible with --all -- pass a single theme export file instead")
+
+        logger.info("Loading theme export from %s (skipping source fetch)", args.import_from)
+        with open(args.import_from, "r", encoding="utf-8") as f:
+            exported = json.load(f)
+
+        if args.execute:
+            name = args.name or f"{exported.get('theme_name') or 'Source theme'} (migrated)"
+            import_theme(dest_client, exported, name, args.seed_zip, args.publish, src_client=None)
+        else:
+            logger.info("Dry-run finished. Re-run with --execute to create the theme on the destination store")
+        return
+
+    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+    require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
+
+    src_client = make_client(src_shop, src_token)
 
     if args.all:
         if not args.execute:
