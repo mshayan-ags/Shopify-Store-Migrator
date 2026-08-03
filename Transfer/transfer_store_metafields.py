@@ -1,33 +1,3 @@
-"""Transfer all store metafields between Shopify stores.
-
-This script exports metafield *definitions* (namespace/key/type/validations/pinned
-state -- the schema shown in the Shopify admin) and metafield *values* from the
-source store across common owner types, and imports both into the destination
-store. Definitions are created first so values land against the correct type.
-
-Existing metafield values are updated in place via metafieldsSet, so re-running
-this script keeps the destination an exact copy of source values. Existing
-definitions are left untouched (a definition's type can't change after creation).
-
-Note: this only covers metafields (attached to a resource). For standalone
-Metaobject entries and their definitions, see transfer_metaobjects.py.
-
-Supported owner types:
-- shop
-- collection
-- product
-- blog
-- article
-- page
-- customer
-- location
-- order
-- draft_order
-
-Examples:
-    python transfer_store_metafields.py --out Results
-    python transfer_store_metafields.py --execute
-"""
 import argparse
 import json
 import logging
@@ -39,21 +9,18 @@ from typing import Any, Callable, Dict, List, Optional, TypeVar
 from dotenv import load_dotenv
 
 from utils.shopify_client import ShopifyClient
-from Transfer.transfer_collections import (
+from transfer.transfer_collections import (
     admin_base_for_host,
     build_collection_lookup,
     fetch_all_collections,
 )
-# Re-exported for scripts that already import these from here; the canonical
-# definitions live in concurrency_utils.py (zero project-internal imports) so
-# that transfer_collections.py can use them too without an import cycle back
-# to this module (which imports from transfer_collections.py above).
-from utils.concurrency_utils import retry_with_backoff, gql_quote  # noqa: F401
+from utils.concurrency_utils import retry_with_backoff, gql_quote
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_store_metafields")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 T = TypeVar("T")
 
@@ -83,14 +50,6 @@ def chunk_items(items: List[Dict[str, Any]], chunk_size: int = 25) -> List[List[
 
 
 def fetch_all_products_with_title(client: ShopifyClient) -> List[Dict[str, Any]]:
-    """Fetch every product's id/handle/title via GraphQL cursor pagination.
-
-    REST's products.json since_id pagination silently stops early on stores
-    with enough products (confirmed live: it returned 442 of 1995 real
-    products here with no error, while this GraphQL walk correctly returns
-    all 1995 with the exact same token/scope) -- never paginate products.json
-    directly via fetch_paginated_resource.
-    """
     products: List[Dict[str, Any]] = []
     after_clause = ""
 
@@ -120,7 +79,6 @@ def fetch_all_products_with_title(client: ShopifyClient) -> List[Dict[str, Any]]
 
 
 def fetch_paginated_resource(client: ShopifyClient, path: str, response_key: str) -> List[Dict[str, Any]]:
-    """Fetch a paginated REST resource with retry logic."""
     items: List[Dict[str, Any]] = []
     since_id = 0
 
@@ -146,17 +104,6 @@ def fetch_paginated_resource(client: ShopifyClient, path: str, response_key: str
 
 
 def fetch_owner_metafields(client: ShopifyClient, owner_resource: str, owner_id: int) -> List[Dict[str, Any]]:
-    """Fetch all metafields for a given owner resource using pagination with retry logic.
-
-    Shopify's generic /metafields.json endpoint silently ignores bare
-    `owner_resource`/`owner_id` query params and returns unfiltered results, so the
-    filter must be namespaced as `metafield[owner_resource]` / `metafield[owner_id]`.
-
-    "shop" is a special case: there's no owner_id to filter by (a store has no
-    numeric identity in this endpoint's terms) -- passing owner_resource=shop at
-    all makes the endpoint 404. Shop metafields are simply whatever the plain,
-    unfiltered /metafields.json call returns, since shop is its implicit owner.
-    """
     metafields: List[Dict[str, Any]] = []
     since_id = 0
 
@@ -219,15 +166,6 @@ def _build_metafields_set_mutation(owner_gid: str, batch: List[Dict[str, Any]]) 
 
 
 def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """Upsert metafields on a destination owner using metafieldsSet.
-
-    metafieldsSet is all-or-nothing per call: if even one item in the batch has
-    a userError (e.g. a file/metaobject reference pointing at a resource that
-    doesn't exist on the destination), Shopify rejects every item in that call,
-    including otherwise-valid ones. To avoid losing those, a failed batch's
-    userErrors are parsed for their index (`field: ["metafields", "<index>", ...]`),
-    the offending entries are dropped, and the rest of the batch is retried.
-    """
     updated: List[Dict[str, Any]] = []
     skipped: List[Dict[str, Any]] = []
 
@@ -240,9 +178,6 @@ def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[
             try:
                 result = retry_with_backoff(lambda: dest_client.mutation(mutation))
             except Exception as e:
-                # A hard GraphQL error (e.g. ACCESS_DENIED for a namespace reserved by
-                # another app) raises here instead of populating userErrors -- catch it
-                # so one bad batch doesn't abort every remaining owner's metafield sync.
                 logger.warning("MetafieldsSet failed: %s", e)
                 for mf in batch:
                     skipped.append(
@@ -269,7 +204,6 @@ def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[
                             continue
 
                 if not bad_indices:
-                    # Can't isolate which item(s) caused it -- drop the whole batch.
                     error_text = "; ".join(f"{err.get('field')}: {err.get('message')}" for err in errors)
                     logger.warning("MetafieldsSet returned userErrors: %s", error_text)
                     for mf in batch:
@@ -292,7 +226,7 @@ def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[
                         skipped.append({"namespace": mf.get("namespace"), "key": mf.get("key"), "reason": message})
 
                 batch = [mf for i, mf in enumerate(batch) if i not in bad_indices]
-                continue  # retry with the remaining valid items
+                continue
 
             for metafield in payload.get("metafields", []):
                 updated.append(
@@ -303,7 +237,7 @@ def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[
                         "type": metafield.get("type"),
                     }
                 )
-            break  # batch succeeded, move to the next chunk
+            break
 
     return {
         "updated_count": len(updated),
@@ -313,10 +247,6 @@ def set_metafields(dest_client: ShopifyClient, owner_gid: str, metafields: List[
     }
 
 
-# MetafieldOwnerType values that support formal metafield *definitions* (the
-# schema/validation/pinning layer shown in the Shopify admin, as opposed to a
-# bare metafield value). Product images have no definitions API, so their
-# metafields only ever transfer as plain values via fetch_owner_metafields above.
 METAFIELD_DEFINITION_OWNER_TYPES = [
     "SHOP",
     "COLLECTION",
@@ -333,7 +263,6 @@ METAFIELD_DEFINITION_OWNER_TYPES = [
 
 
 def fetch_metafield_definitions(client: ShopifyClient, owner_type: str) -> List[Dict[str, Any]]:
-    """Fetch every metafield definition for one MetafieldOwnerType via GraphQL."""
     definitions: List[Dict[str, Any]] = []
     after_clause = ""
 
@@ -370,7 +299,6 @@ def fetch_metafield_definitions(client: ShopifyClient, owner_type: str) -> List[
 
 
 def export_metafield_definitions(src_client: ShopifyClient) -> List[Dict[str, Any]]:
-    """Export every metafield definition (schema/type/pin state) across all owner types."""
     exported = []
     for owner_type in METAFIELD_DEFINITION_OWNER_TYPES:
         for d in fetch_metafield_definitions(src_client, owner_type):
@@ -395,20 +323,6 @@ def import_metafield_definitions(
     exported: List[Dict[str, Any]],
     metaobject_gid_map: Optional[Dict[str, str]] = None,
 ) -> None:
-    """Create any source metafield definition missing on the destination, pinned to match source.
-
-    Existing definitions are left as-is: a definition's `type` can't be changed after
-    creation, so blindly recreating/mutating a mismatched existing one risks breaking
-    values already set through it. Definitions should be synced before metafield
-    values (see main()) so values land against the correct type on first write.
-
-    `metaobject_gid_map` (source MetaobjectDefinition GID -> destination GID, as
-    returned by transfer_metaobjects.import_metaobjects) is required to correctly
-    create metaobject_reference-type definitions, whose `metaobject_definition_id`
-    validation embeds a GID that's meaningless on the destination store. Without
-    it, such definitions are skipped with a warning rather than pointing at the
-    wrong store's metaobject definition.
-    """
     metaobject_gid_map = metaobject_gid_map or {}
     existing_by_owner: Dict[str, Dict[Any, Dict[str, Any]]] = {
         owner_type: {(d["namespace"], d["key"]): d for d in fetch_metafield_definitions(dest_client, owner_type)}
@@ -481,12 +395,6 @@ def import_metafield_definitions(
             if errors:
                 create_error = str(errors)
         except Exception as e:
-            # Some namespaces (e.g. "shopify", or an app's own reserved namespace
-            # like "reviews") are Shopify *standard* definitions or another app's
-            # private schema -- metafieldDefinitionCreate rejects them outright
-            # with a hard ACCESS_DENIED/"reserved" error rather than a userErrors
-            # entry. Fall back to standardMetafieldDefinitionEnable, which is the
-            # correct mutation for turning on Shopify's own predefined templates.
             create_error = str(e)
 
         if create_error is None:
@@ -580,9 +488,6 @@ def draft_order_gid(draft_order_id: int) -> str:
 
 
 def safe_fetch(label: str, func: Callable[[], List[Any]]) -> List[Any]:
-    """Run a resource fetch; on any failure (e.g. missing API scope), warn and
-    return an empty list instead of aborting the entire export.
-    """
     try:
         return func()
     except Exception as e:
@@ -596,13 +501,6 @@ def safe_fetch(label: str, func: Callable[[], List[Any]]) -> List[Any]:
 
 
 def fetch_all_source_owners(src_client: ShopifyClient) -> Dict[str, List[Dict[str, Any]]]:
-    """Fetch source owners and their identifying data.
-
-    Each resource type is fetched independently: a store's custom app may only
-    have a subset of scopes granted (e.g. products/orders but not content or
-    customers), so one 403 must not prevent every other owner type from
-    exporting.
-    """
     owners: Dict[str, List[Dict[str, Any]]] = {owner_type: [] for owner_type in SUPPORTED_OWNER_TYPES}
 
     shop = safe_fetch("shop", lambda: [retry_with_backoff(lambda: src_client.rest_get("shop")).get("shop") or {}])
@@ -761,7 +659,6 @@ def fetch_all_source_owners(src_client: ShopifyClient) -> Dict[str, List[Dict[st
 
 
 def export_store_metafields(src_client: ShopifyClient) -> Dict[str, Any]:
-    """Export all supported store metafields from the source store, processing one owner at a time."""
     exported: Dict[str, Any] = {"owners": [], "unsupported_owners": []}
     source_owners = fetch_all_source_owners(src_client)
 
@@ -774,16 +671,12 @@ def export_store_metafields(src_client: ShopifyClient) -> Dict[str, Any]:
             label = item.get("handle") or item.get("title") or item.get("email") or item.get("name") or str(owner_id)
             logger.info("Exporting metafields for %s (%s)", owner_type, label)
 
-            # Fetch one owner's metafields. A single owner's fetch failing (e.g. a
-            # REST quirk for its resource type) must not discard every other
-            # owner already exported in what can be a multi-hour run.
             try:
                 metafields = fetch_owner_metafields(src_client, owner_type, owner_id)
             except Exception as e:
                 logger.warning("Failed to fetch metafields for %s (%s): %s", owner_type, label, e)
                 continue
 
-            # Add to exported data
             owner_entry = {
                 "owner_resource": owner_type,
                 "owner_id": owner_id,
@@ -797,12 +690,6 @@ def export_store_metafields(src_client: ShopifyClient) -> Dict[str, Any]:
 
 
 def build_destination_indexes(dest_client: ShopifyClient) -> Dict[str, Any]:
-    """Build lookup tables for destination owners.
-
-    Each resource is fetched via safe_fetch so a 403 on one (e.g. missing
-    content/customer scope) still leaves the other lookup tables usable --
-    metafields for unreachable owner types are simply skipped later on.
-    """
     indexes: Dict[str, Any] = {}
 
     shop_rows = safe_fetch("destination shop", lambda: [retry_with_backoff(lambda: dest_client.rest_get("shop")).get("shop") or {}])
@@ -933,7 +820,6 @@ def build_destination_indexes(dest_client: ShopifyClient) -> Dict[str, Any]:
 
 
 def resolve_owner_gid(owner_type: str, identity: Dict[str, Any], indexes: Dict[str, Any]) -> Optional[str]:
-    """Resolve a source owner to a destination owner GID."""
     if owner_type == "shop":
         shop_id = indexes.get("shop", {}).get("id")
         return shop_gid(shop_id) if shop_id else None
@@ -1018,7 +904,6 @@ def resolve_owner_gid(owner_type: str, identity: Dict[str, Any], indexes: Dict[s
 
 
 def import_store_metafields(dest_client: ShopifyClient, exported: Dict[str, Any]) -> None:
-    """Import all exported metafields into matching destination owners."""
     indexes = build_destination_indexes(dest_client)
 
     updated_owners = 0
@@ -1064,64 +949,102 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Transfer all store metafields from source to destination Shopify stores")
     parser.add_argument("--execute", action="store_true", help="Actually write metafields to the destination store")
     parser.add_argument("--out", default="Results", help="Output directory for the export JSON")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed "
+            "in this mode."
+        ),
+    )
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_host = shop_host(src_shop)
     dest_host = shop_host(dest_shop)
-
-    src_client = ShopifyClient(access_token=src_token)
-    src_client.set_shop(admin_base_for_host(src_host), f"https://{src_host}/admin/oauth/access_token")
-
     dest_client = ShopifyClient(access_token=dest_token)
     dest_client.set_shop(admin_base_for_host(dest_host), f"https://{dest_host}/admin/oauth/access_token")
 
-    logger.info("Exporting metafield definitions from %s", src_host)
-    exported_definitions = export_metafield_definitions(src_client)
+    src_client: Optional[ShopifyClient] = None
 
-    logger.info("Exporting store metafields from %s", src_host)
-    exported = export_store_metafields(src_client)
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            loaded = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        exported_definitions = loaded.get("definitions", [])
+        exported = {
+            "owners": loaded.get("owners", []),
+            "unsupported_owners": loaded.get("unsupported_owners", []),
+        }
+        logger.info(
+            "Loaded %s metafield definition(s) and %s owner(s) to import",
+            len(exported_definitions),
+            len(exported["owners"]),
+        )
+    else:
+        src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+        src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+        require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
 
-    ts = int(time.time())
-    definitions_file = out_dir / f"metafield_definitions_export_{ts}.json"
-    with open(definitions_file, "w", encoding="utf-8") as f:
-        json.dump(exported_definitions, f, indent=2, ensure_ascii=False)
-    logger.info("Definitions export complete: %s (%s definitions)", definitions_file, len(exported_definitions))
+        src_host = shop_host(src_shop)
+        src_client = ShopifyClient(access_token=src_token)
+        src_client.set_shop(admin_base_for_host(src_host), f"https://{src_host}/admin/oauth/access_token")
 
-    out_file = out_dir / f"store_metafields_export_{ts}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(exported, f, indent=2, ensure_ascii=False)
+        logger.info("Exporting metafield definitions from %s", src_host)
+        exported_definitions = export_metafield_definitions(src_client)
 
-    logger.info("Export complete: %s", out_file)
-    logger.info("Exported %s owners", len(exported.get("owners", [])))
+        logger.info("Exporting store metafields from %s", src_host)
+        exported = export_store_metafields(src_client)
+
+        ts = int(time.time())
+        definitions_file = out_dir / f"metafield_definitions_export_{ts}.json"
+        with open(definitions_file, "w", encoding="utf-8") as f:
+            json.dump(exported_definitions, f, indent=2, ensure_ascii=False)
+        logger.info("Definitions export complete: %s (%s definitions)", definitions_file, len(exported_definitions))
+
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported_definitions, out_dir / f"metafield_definitions_export_{ts}.xlsx")
+
+        out_file = out_dir / f"store_metafields_export_{ts}.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(exported, f, indent=2, ensure_ascii=False)
+
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported, out_dir / f"store_metafields_export_{ts}.xlsx")
+
+        logger.info("Export complete: %s", out_file)
+        logger.info("Exported %s owners", len(exported.get("owners", [])))
 
     if args.execute:
-        # Metaobjects first: some metafield definitions reference a metaobject
-        # definition by GID and need the source-GID -> dest-GID map to remap it.
-        # Deferred import avoids a circular import (transfer_metaobjects imports
-        # retry_with_backoff/gql_quote from this module).
-        import Transfer.transfer_metaobjects as transfer_metaobjects
+        if src_client is not None:
+            import transfer.transfer_metaobjects as transfer_metaobjects
 
-        logger.info("Exporting/importing metaobjects into %s", dest_host)
-        metaobject_gid_map = transfer_metaobjects.import_metaobjects(
-            dest_client, transfer_metaobjects.export_metaobjects(src_client)
-        )
+            logger.info("Exporting/importing metaobjects into %s", dest_host)
+            metaobject_gid_map = transfer_metaobjects.import_metaobjects(
+                dest_client, transfer_metaobjects.export_metaobjects(src_client)
+            )
+        else:
+            logger.warning(
+                "Skipping metaobjects sync -- no live source connection (import-from mode). Any "
+                "metaobject_reference-type metafield definition will be skipped unless its metaobject "
+                "definition already exists on the destination (transfer it separately via "
+                "transfer_metaobjects.py --import-from first if needed)."
+            )
+            metaobject_gid_map = {}
 
-        # Definitions next: they declare each metafield's type/validations/pinned
-        # state, so values written afterward land against the correct schema
-        # instead of risking a type-conflict error against an auto-created definition.
         logger.info("Importing metafield definitions into %s", dest_host)
         import_metafield_definitions(dest_client, exported_definitions, metaobject_gid_map)
 
