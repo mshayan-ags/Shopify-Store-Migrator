@@ -1,24 +1,3 @@
-"""Audit-only report of installed apps/integrations -- NOT a transfer script.
-
-This is NOT automatable. Shopify's Admin API deliberately does not let one
-app enumerate *other* apps installed on a store (a security/privacy
-boundary -- `appInstallations` only returns installations of the SAME app
-across every store it's installed on, which for this single custom app is
-just itself). There is no documented, general-purpose query that lists a
-store's full installed-app roster, so nothing here can be written to the
-destination store automatically.
-
-What this script actually does: reports this custom app's own installation
-(access scopes it's been granted) on each store, as the only thing the
-Admin API will show it, and prints a reminder checklist. The real inventory
-of installed apps on Src has to come from a human looking at
-Settings > Apps and sales channels in the Shopify admin, then reinstalling/
-reconfiguring the equivalent apps on dest -- app installations are
-OAuth-authorized per store and can't be copied by API regardless of scope.
-
-Usage:
-    python audit_installed_apps.py
-"""
 import json
 import logging
 import os
@@ -28,13 +7,14 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
+from transfer.transfer_product import make_client
 from utils.concurrency_utils import retry_with_backoff
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("audit_installed_apps")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 QUERY = """
 query {
@@ -64,10 +44,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     out_dir = Path("Results")
     out_dir.mkdir(parents=True, exist_ok=True)
