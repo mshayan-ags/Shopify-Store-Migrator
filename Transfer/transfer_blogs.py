@@ -1,13 +1,3 @@
-"""Transfer blogs and their articles from Src to dest.
-
-Requires the `read_content` / `write_content` Admin API scope on both stores'
-custom apps. Grant it under Shopify Admin > Apps > [app name] > Configuration,
-then reinstall the app to refresh the access token stored in .env.
-
-Usage:
-    python transfer_blogs.py                # dry-run export
-    python transfer_blogs.py --execute       # create/update blogs+articles on dest
-"""
 import argparse
 import json
 import logging
@@ -18,14 +8,15 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
-from Transfer.transfer_store_metafields import retry_with_backoff, set_metafields, gql_quote
+from transfer.transfer_product import make_client
+from transfer.transfer_store_metafields import retry_with_backoff, set_metafields, gql_quote
 from utils.shopify_graphql_utils import paginate_connection, export_metafields, mutation_errors
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_blogs")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 BLOG_NODE_FIELDS = """
@@ -306,33 +297,54 @@ def import_blogs(dest_client, exported: List[Dict[str, Any]]) -> None:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Transfer blogs and articles from Src to dest")
     parser.add_argument("--execute", action="store_true", help="Create/update blogs and articles on the destination store")
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed "
+            "in this mode."
+        ),
+    )
     parser.add_argument("--out", default="Results", help="Output directory for the export JSON")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
 
-    logger.info("Exporting blogs from %s", src_shop)
-    exported = export_blogs(src_client)
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            exported = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+    else:
+        src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+        src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+        require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
 
-    ts = int(time.time())
-    out_file = out_dir / f"blogs_export_{ts}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(exported, f, indent=2, ensure_ascii=False)
-    logger.info("Export complete: %s", out_file)
+        src_client = make_client(src_shop, src_token)
+
+        logger.info("Exporting blogs from %s", src_shop)
+        exported = export_blogs(src_client)
+
+        ts = int(time.time())
+        out_file = out_dir / f"blogs_export_{ts}.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(exported, f, indent=2, ensure_ascii=False)
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported, out_dir / f"blogs_export_{ts}.xlsx")
+        logger.info("Export complete: %s", out_file)
 
     if args.execute:
         logger.info("Importing blogs into %s", dest_shop)
