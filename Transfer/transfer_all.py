@@ -1,62 +1,3 @@
-"""Run a complete Src -> dest store migration in the correct order.
-
-Runs, in sequence:
-  1. Pages
-  2. Blogs + articles
-  3. Products (all of them, with images/variants/metafields)
-  4. Collections (product assignment needs products to already exist)
-  5. Customers
-  6. Orders (needs products + customers already transferred, for SKU/email matching)
-  7. Navigation menus (needs products/collections/pages/blogs for resourceId remapping)
-  8. Redirects
-  9. Metaobjects (definitions + entries)
- 10. Metafield definitions + store metafields (shop/blog/article/page/customer/
-     location/order/draft_order -- the resource-specific steps above already cover
-     product/variant/image/collection metafields, so this last pass mops up the
-     remaining global owner types; metaobject-reference definitions are remapped
-     using the GID map produced by the metaobjects step)
- 11. Shop policies (refund/shipping/privacy/terms/etc.)
- 12. Locations (name + address only; needs read_locations/write_locations, not
-     currently granted on either store)
- 13. Discounts (basic % / amount off + free shipping, code and automatic).
-     Active/scheduled only by default -- Src has ~10,000 discount nodes,
-     almost all expired single-use affiliate codes from a referral app, which
-     would be pure noise to copy. Not covered by this or any script: Buy X Get Y
-     discounts, and app-owned discounts (tied to whatever app created them).
- 14. Theme code (see transfer_theme.py) -- copies every file from the source
-     theme into a new UNPUBLISHED theme on the destination. Needs write_themes
-     access PLUS a separate Shopify-granted exemption to modify themes via API;
-     will fail until both are in place.
- 15. Shipping rate configuration (see transfer_shipping.py) -- flat-rate zones
-     for custom delivery profiles, and for the store's default profile. Needs
-     the shipping scope/manage_delivery_settings permission, not currently
-     granted on either store. Best run after locations, so zones can be
-     matched to the right destination location by name.
-
-Not covered by this migration at all, because the Admin API doesn't expose
-them: installed apps/integrations, payment configuration, and staff accounts
-(no mutation exists to install an app, configure a payment gateway, or invite
-a staff member -- see audit_installed_apps.py / audit_payment_config.py /
-audit_staff_accounts.py for read-only reports of what has to be recreated by
-hand instead). Tax configuration is almost entirely in the same boat --
-audit_tax_settings.py reports the two read-only fields the API does expose.
-Checkout customization (checkoutBrandingUpsert) is Shopify Plus-only and
-neither store is on Plus, so it isn't attempted at all. Gift cards are
-deliberately excluded -- copying live cash-equivalent balances needs an
-explicit decision, not a default.
-
-Each step needs its own Admin API scopes granted on both stores' custom apps --
-see the docstring of the corresponding transfer_*.py script for which ones.
-A step whose required data can't be read (403) is skipped with a warning rather
-than aborting the whole run.
-
-Usage:
-    python transfer_all.py                              # dry-run export of everything
-    python transfer_all.py --execute                     # run the full migration for real
-    python transfer_all.py --execute --skip orders,customers   # everything except orders/customers
-    python transfer_all.py --execute --only products,collections
-    python transfer_all.py --execute --skip pages,blogs,metaobjects,store_metafields
-"""
 import argparse
 import json
 import logging
@@ -67,20 +8,29 @@ from pathlib import Path
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client, fetch_all_product_handles, transfer_one as transfer_one_product
+from transfer.transfer_product import make_client, fetch_all_product_handles, transfer_one as transfer_one_product
 from utils.concurrency_utils import run_concurrently, DEFAULT_WORKERS
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_all")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
-def save_export(name: str, data, out_dir: Path) -> None:
-    out_file = out_dir / f"{name}_export_{int(time.time())}.json"
+def save_export(name: str, data, out_dir: Path, write_xlsx: bool = False) -> None:
+    ts = int(time.time())
+    out_file = out_dir / f"{name}_export_{ts}.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2, ensure_ascii=False)
     logger.info("Saved %s export: %s", name, out_file)
+
+    if write_xlsx:
+        from utils.tabular_io import export_to_xlsx
+        try:
+            export_to_xlsx(data, out_dir / f"{name}_export_{ts}.xlsx")
+        except Exception:
+            logger.exception("Failed to write .xlsx export for %s", name)
 
 STEPS = [
     "pages",
@@ -88,23 +38,33 @@ STEPS = [
     "products",
     "collections",
     "customers",
+    "customer_segments",
     "orders",
+    "draft_orders",
     "navigation",
     "redirects",
     "metaobjects",
     "store_metafields",
     "policies",
     "locations",
+    "markets",
     "discounts",
+    "selling_plans",
+    "b2b",
+    "files",
     "theme",
     "shipping",
+    "translations",
 ]
+
+OPT_IN_STEPS = ["gift_cards"]
 
 
 def run_step(name: str, fn) -> None:
-    logger.info("=" * 20 + f" STEP: {name} " + "=" * 20)
+    logger.info("Starting step: %s", name)
     try:
         fn()
+        logger.info("Completed step: %s", name)
     except Exception:
         logger.exception("Step '%s' failed; continuing with the remaining steps", name)
 
@@ -113,8 +73,13 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run the full Src -> dest store migration")
     parser.add_argument("--execute", action="store_true", help="Actually write to the destination store (default is dry-run export only)")
     parser.add_argument("--out", default="Results", help="Output directory for export JSON files")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside each step's .json export")
     parser.add_argument("--skip", default="", help="Comma-separated steps to skip: " + ", ".join(STEPS))
-    parser.add_argument("--only", default="", help="Comma-separated steps to run exclusively: " + ", ".join(STEPS))
+    parser.add_argument(
+        "--only",
+        default="",
+        help="Comma-separated steps to run exclusively: " + ", ".join(STEPS) + " (also accepts opt-in steps: " + ", ".join(OPT_IN_STEPS) + ")",
+    )
     parser.add_argument("--product-limit", type=int, default=None, help="Only transfer the first N products")
     parser.add_argument("--order-limit", type=int, default=None, help="Only transfer the first N orders")
     parser.add_argument(
@@ -127,6 +92,24 @@ def main() -> None:
         type=int,
         default=DEFAULT_WORKERS,
         help="Number of items to transfer concurrently within each of the products/orders/collections steps (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--include-gift-cards",
+        action="store_true",
+        help=(
+            "Also run the gift_cards step (off by default -- creates real monetary balance on the "
+            "destination store, see transfer_gift_cards.py). Requires --gift-cards-i-understand-this-creates-real-balance too."
+        ),
+    )
+    parser.add_argument(
+        "--gift-cards-i-understand-this-creates-real-balance",
+        action="store_true",
+        help="Confirms you understand --include-gift-cards creates new gift cards with real redeemable balance on the destination store",
+    )
+    parser.add_argument(
+        "--translations-locale",
+        default=None,
+        help="Comma-separated locale codes for the translations step (default: every published, non-primary destination locale)",
     )
     args = parser.parse_args()
 
@@ -143,10 +126,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -156,10 +139,10 @@ def main() -> None:
 
     if should_run("pages"):
         def step():
-            import Transfer.transfer_pages as m
+            import transfer.transfer_pages as m
 
             exported = m.export_pages(src_client)
-            save_export("pages", exported, out_dir)
+            save_export("pages", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_pages(dest_client, exported)
 
@@ -167,10 +150,10 @@ def main() -> None:
 
     if should_run("blogs"):
         def step():
-            import Transfer.transfer_blogs as m
+            import transfer.transfer_blogs as m
 
             exported = m.export_blogs(src_client)
-            save_export("blogs", exported, out_dir)
+            save_export("blogs", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_blogs(dest_client, exported)
 
@@ -204,7 +187,7 @@ def main() -> None:
 
     if should_run("collections"):
         def step():
-            import Transfer.transfer_collections as m
+            import transfer.transfer_collections as m
 
             if args.execute:
                 m.transfer_collections_one_by_one(src_client, dest_client, out_dir, max_workers=args.workers)
@@ -215,32 +198,54 @@ def main() -> None:
 
     if should_run("customers"):
         def step():
-            import Transfer.transfer_customers as m
+            import transfer.transfer_customers as m
 
             exported = m.export_customers(src_client)
-            save_export("customers", exported, out_dir)
+            save_export("customers", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_customers(dest_client, exported)
 
         run_step("customers", step)
 
+    if should_run("customer_segments"):
+        def step():
+            import transfer.transfer_customer_segments as m
+
+            exported = m.export_segments(src_client)
+            save_export("customer_segments", exported, out_dir, write_xlsx=args.xlsx)
+            if args.execute:
+                m.import_segments(dest_client, exported)
+
+        run_step("customer_segments", step)
+
     if should_run("orders"):
         def step():
-            import Transfer.transfer_orders as m
+            import transfer.transfer_orders as m
 
             exported = m.export_orders(src_client, limit=args.order_limit)
-            save_export("orders", exported, out_dir)
+            save_export("orders", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_orders(dest_client, exported, max_workers=args.workers)
 
         run_step("orders", step)
 
+    if should_run("draft_orders"):
+        def step():
+            import transfer.transfer_draft_orders as m
+
+            exported = m.export_draft_orders(src_client, limit=args.order_limit)
+            save_export("draft_orders", exported, out_dir, write_xlsx=args.xlsx)
+            if args.execute:
+                m.import_draft_orders(dest_client, exported, max_workers=args.workers)
+
+        run_step("draft_orders", step)
+
     if should_run("navigation"):
         def step():
-            import Transfer.transfer_navigation as m
+            import transfer.transfer_navigation as m
 
             exported = m.export_menus(src_client)
-            save_export("navigation", exported, out_dir)
+            save_export("navigation", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_menus(dest_client, exported)
 
@@ -248,10 +253,10 @@ def main() -> None:
 
     if should_run("redirects"):
         def step():
-            import Transfer.transfer_redirects as m
+            import transfer.transfer_redirects as m
 
             exported = m.export_redirects(src_client)
-            save_export("redirects", exported, out_dir)
+            save_export("redirects", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_redirects(dest_client, exported)
 
@@ -261,10 +266,10 @@ def main() -> None:
     if should_run("metaobjects"):
         def step():
             nonlocal metaobject_gid_map
-            import Transfer.transfer_metaobjects as m
+            import transfer.transfer_metaobjects as m
 
             exported = m.export_metaobjects(src_client)
-            save_export("metaobjects", exported, out_dir)
+            save_export("metaobjects", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 metaobject_gid_map = m.import_metaobjects(dest_client, exported)
 
@@ -272,13 +277,13 @@ def main() -> None:
 
     if should_run("store_metafields"):
         def step():
-            import Transfer.transfer_store_metafields as m
+            import transfer.transfer_store_metafields as m
 
             exported_definitions = m.export_metafield_definitions(src_client)
-            save_export("metafield_definitions", exported_definitions, out_dir)
+            save_export("metafield_definitions", exported_definitions, out_dir, write_xlsx=args.xlsx)
 
             exported = m.export_store_metafields(src_client)
-            save_export("store_metafields", exported, out_dir)
+            save_export("store_metafields", exported, out_dir, write_xlsx=args.xlsx)
 
             if args.execute:
                 m.import_metafield_definitions(dest_client, exported_definitions, metaobject_gid_map)
@@ -288,10 +293,10 @@ def main() -> None:
 
     if should_run("policies"):
         def step():
-            import Transfer.transfer_policies as m
+            import transfer.transfer_policies as m
 
             exported = m.export_policies(src_client)
-            save_export("policies", exported, out_dir)
+            save_export("policies", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_policies(dest_client, exported)
 
@@ -299,32 +304,86 @@ def main() -> None:
 
     if should_run("locations"):
         def step():
-            import Transfer.transfer_locations as m
+            import transfer.transfer_locations as m
 
             exported = m.export_locations(src_client)
-            save_export("locations", exported, out_dir)
+            save_export("locations", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_locations(dest_client, exported)
 
         run_step("locations", step)
 
+    if should_run("markets"):
+        def step():
+            import transfer.transfer_markets as m
+
+            exported = m.export_markets(src_client)
+            save_export("markets", exported, out_dir, write_xlsx=args.xlsx)
+            if args.execute:
+                m.import_markets(dest_client, exported)
+
+        run_step("markets", step)
+
     if should_run("discounts"):
         def step():
-            import Transfer.transfer_discounts as m
+            import transfer.transfer_discounts as m
 
             exported = m.export_discounts(src_client, include_expired=args.include_expired_discounts)
-            save_export("discounts", exported, out_dir)
+            save_export("discounts", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_discounts(dest_client, exported)
 
         run_step("discounts", step)
 
+    if should_run("selling_plans"):
+        def step():
+            import transfer.transfer_selling_plans as m
+
+            exported = m.export_selling_plan_groups(src_client)
+            save_export("selling_plans", exported, out_dir, write_xlsx=args.xlsx)
+            if args.execute:
+                m.import_selling_plan_groups(dest_client, exported)
+
+        run_step("selling_plans", step)
+
+    if should_run("b2b"):
+        def step():
+            import transfer.transfer_b2b as m
+
+            exported_companies = m.export_companies(src_client)
+            save_export("b2b_companies", exported_companies, out_dir, write_xlsx=args.xlsx)
+            try:
+                exported_catalogs = m.export_catalogs(src_client)
+                save_export("b2b_catalogs", exported_catalogs, out_dir, write_xlsx=args.xlsx)
+            except Exception:
+                logger.exception("Failed to export B2B catalogs/price lists -- continuing without them")
+                exported_catalogs = []
+
+            if args.execute:
+                m.import_companies(dest_client, exported_companies)
+                if exported_catalogs:
+                    variant_sku_index = m.build_dest_variant_sku_index(dest_client)
+                    m.import_catalogs(dest_client, exported_catalogs, variant_sku_index)
+
+        run_step("b2b", step)
+
+    if should_run("files"):
+        def step():
+            import transfer.transfer_files as m
+
+            exported = m.export_files(src_client)
+            save_export("files", exported, out_dir, write_xlsx=args.xlsx)
+            if args.execute:
+                m.import_files(dest_client, exported)
+
+        run_step("files", step)
+
     if should_run("theme"):
         def step():
-            import Transfer.transfer_theme as m
+            import transfer.transfer_theme as m
 
             exported = m.export_theme(src_client, None, "MAIN", out_dir)
-            save_export("theme", exported, out_dir)
+            save_export("theme", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 name = f"{exported.get('theme_name') or 'Source theme'} (migrated)"
                 m.import_theme(dest_client, exported, name, None, publish=False, src_client=src_client)
@@ -333,14 +392,61 @@ def main() -> None:
 
     if should_run("shipping"):
         def step():
-            import Transfer.transfer_shipping as m
+            import transfer.transfer_shipping as m
 
             exported = m.export_shipping(src_client)
-            save_export("shipping", exported, out_dir)
+            save_export("shipping", exported, out_dir, write_xlsx=args.xlsx)
             if args.execute:
                 m.import_shipping(dest_client, exported)
 
         run_step("shipping", step)
+
+    gift_cards_selected = "gift_cards" in only or (not only and args.include_gift_cards)
+    if gift_cards_selected and "gift_cards" not in skip:
+        if args.execute and not args.gift_cards_i_understand_this_creates_real_balance:
+            logger.warning(
+                "Skipping gift_cards step: --execute was passed without "
+                "--gift-cards-i-understand-this-creates-real-balance, so no gift cards will be created."
+            )
+        else:
+            def step():
+                import transfer.transfer_gift_cards as m
+
+                exported = m.export_gift_cards(src_client)
+                save_export("gift_cards", exported, out_dir, write_xlsx=args.xlsx)
+                if args.execute:
+                    marker_path = out_dir / "gift_cards_migrated.json"
+                    m.import_gift_cards(dest_client, exported, marker_path)
+
+            run_step("gift_cards", step)
+
+    if should_run("translations"):
+        def step():
+            import transfer.transfer_translations as m
+
+            locale_filter = [c.strip() for c in args.translations_locale.split(",") if c.strip()] if args.translations_locale else None
+            target_locales = m.resolve_target_locales(src_client, dest_client, locale_filter)
+            if not target_locales:
+                logger.warning("No destination locale(s) to translate into -- skipping translations step")
+                return
+
+            indices = m.build_destination_indices(dest_client)
+            stats = {}
+            export_records = []
+            for resource_type in m.GENERIC_RESOURCE_TYPES:
+                resource_stats = {}
+                m.transfer_resource_type_translations(
+                    src_client, dest_client, resource_type, target_locales, indices, resource_stats, args.execute, export_records
+                )
+                stats[m.RESOURCE_TYPE_LABELS[resource_type]] = resource_stats
+
+            policy_stats = {}
+            m.transfer_policy_translations(src_client, dest_client, target_locales, policy_stats, args.execute, export_records)
+            stats["policy"] = policy_stats
+
+            save_export("translations", {"target_locales": target_locales, "stats": stats, "records": export_records}, out_dir, write_xlsx=args.xlsx)
+
+        run_step("translations", step)
 
     logger.info("Migration run complete (%s)", "executed" if args.execute else "dry-run")
 
