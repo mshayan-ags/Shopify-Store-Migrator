@@ -1,14 +1,3 @@
-"""Transfer collections between Shopify stores.
-
-This script currently supports a dry-run export that collects:
-- custom and smart collection metadata
-- images (downloaded)
-- metafields
-- list of product handles belonging to each collection
-
-To perform a real transfer (create collections on destination and assign
-products), run with `--execute` after reviewing the dry-run output.
-"""
 import argparse
 import base64
 import json
@@ -26,11 +15,12 @@ from dotenv import load_dotenv
 from utils.shopify_client import ShopifyClient
 from utils.config import SHOPIFY_API_VERSION
 from utils.concurrency_utils import run_concurrently, DEFAULT_WORKERS, retry_with_backoff
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_collections")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def host_from_url(url: str) -> str:
@@ -43,13 +33,6 @@ def admin_base_for_host(host: str) -> str:
 
 
 def download_image(url: str, dest: Path, max_retries: int = 3) -> None:
-    """Download url to dest, retrying transient network/TLS hiccups.
-
-    Under concurrent runs (many workers streaming images at once), occasional
-    connection-level failures (including TLS record errors) are common and
-    resolve on retry -- without this, a single hiccup permanently drops that
-    collection's cover image for the run.
-    """
     delay = 1.0
     for attempt in range(max_retries + 1):
         try:
@@ -60,24 +43,26 @@ def download_image(url: str, dest: Path, max_retries: int = 3) -> None:
                     if chunk:
                         f.write(chunk)
             return
-        except Exception as e:
+        except requests.RequestException as e:
             if attempt >= max_retries:
-                logger.warning(f"Failed to download image {url}: {e}")
+                logger.warning("Failed to download image %s after %d attempt(s): %s", url, attempt + 1, e)
                 return
-            logger.warning(f"Transient error downloading image {url} (attempt {attempt + 1}/{max_retries + 1}): {e}. Retrying in {delay:.1f}s...")
+            logger.warning(
+                "Transient error downloading image %s (attempt %d/%d): %s. Retrying in %.1fs...",
+                url, attempt + 1, max_retries + 1, e, delay,
+            )
             time.sleep(delay)
             delay *= 2
+        except OSError as e:
+            logger.warning("Failed to write downloaded image to %s -- not retrying a local filesystem error: %s", dest, e)
+            return
 
 
 def _gql_str(value) -> str:
-    # ensure_ascii=False: see the docstring on concurrency_utils.gql_quote --
-    # the default would mangle emoji/astral characters into a GraphQL parse error.
     return json.dumps(value, ensure_ascii=False) if value else "null"
 
 
 def fetch_collection_seo_fields(client: ShopifyClient, collection_id: int) -> Dict[str, Any]:
-    """seo/sortOrder/templateSuffix are GraphQL-only -- invisible to the REST
-    custom_collections/smart_collections endpoints used everywhere else here."""
     try:
         data = client.query(
             f'{{ collection(id: "gid://shopify/Collection/{collection_id}") {{ '
@@ -131,13 +116,6 @@ def sync_collection_seo_fields(dest_client: ShopifyClient, dest_collection_id, s
 
 
 def sync_collection_image(dest_client: ShopifyClient, dest_collection_id, collection_type: str, image_path: Optional[str]) -> None:
-    """Upload/refresh a collection's cover image on the destination.
-
-    Needed for BOTH the create path and the already-exists path: the REST
-    create payload only sets the image at creation time, so any collection
-    that already existed on the destination (the common case on repeat runs)
-    never got its image set/updated without this explicit sync call.
-    """
     if not dest_collection_id or not image_path or not os.path.exists(image_path):
         return
 
@@ -155,11 +133,6 @@ def sync_collection_image(dest_client: ShopifyClient, dest_collection_id, collec
 
 
 def get_collection_products(src_client: ShopifyClient, collection_id: int) -> list:
-    """Fetch products that belong to a collection via products endpoint.
-
-    Using products?collection_id works for both custom and smart collections
-    and avoids API differences around collects.
-    """
     products = []
     since_id = 0
 
@@ -191,7 +164,6 @@ def get_collection_products(src_client: ShopifyClient, collection_id: int) -> li
 
 
 def fetch_all_products_by_handle(client: ShopifyClient) -> Dict[str, int]:
-    """Return all destination products as a handle->id map using pagination."""
     handle_to_id: Dict[str, int] = {}
     since_id = 0
 
@@ -222,7 +194,6 @@ def fetch_all_products_by_handle(client: ShopifyClient) -> Dict[str, int]:
 
 
 def fetch_all_collections(client: ShopifyClient, resource: str) -> list:
-    """Fetch all collections for a resource (custom_collections or smart_collections)."""
     all_collections = []
     since_id = 0
 
@@ -250,7 +221,6 @@ def get_selected_collections(
     collection_filter: Optional[str] = None,
     initial_limit: Optional[int] = None,
 ) -> list:
-    """Fetch and filter collections for a resource."""
     data = retry_with_backoff(lambda: client.rest_get(resource, params={"limit": 250}))
     collections = data.get(resource, [])
 
@@ -263,7 +233,6 @@ def get_selected_collections(
 
 
 def build_collection_lookup(collections: list) -> Dict[str, Dict[str, Any]]:
-    """Build lookup maps for existing collections by handle and title."""
     by_handle: Dict[str, Dict[str, Any]] = {}
     by_title: Dict[str, Dict[str, Any]] = {}
 
@@ -282,7 +251,6 @@ def build_collection_lookup(collections: list) -> Dict[str, Dict[str, Any]]:
 
 
 def matches_collection_filter(collection: Dict[str, Any], collection_filter: Optional[str]) -> bool:
-    """Return True if collection matches the optional id/handle filter."""
     if not collection_filter:
         return True
 
@@ -301,7 +269,6 @@ def export_collections(
 ) -> Dict[str, Any]:
     out = {"custom_collections": [], "smart_collections": []}
 
-    # Custom collections
     custom_collections = get_selected_collections(
         src_client,
         "custom_collections",
@@ -317,7 +284,6 @@ def export_collections(
         except Exception:
             logger.exception("Failed to fetch products for collection %s", cid)
 
-        # metafields
         metafields = []
         try:
             mf = retry_with_backoff(lambda: src_client.rest_get(
@@ -352,7 +318,6 @@ def export_collections(
             }
         )
 
-    # Smart collections
     smart_collections = get_selected_collections(
         src_client,
         "smart_collections",
@@ -403,19 +368,8 @@ def transfer_collections_one_by_one(
     initial_limit: Optional[int] = None,
     max_workers: int = DEFAULT_WORKERS,
 ) -> Dict[str, Any]:
-    """Transfer collections concurrently (up to max_workers at a time).
-
-    existing_custom/existing_smart are loaded once up front. Concurrent workers
-    only need to read them to detect "already exists" -- Shopify guarantees
-    collection handles are unique within a store, so no two collections in the
-    source list can ever collide with each other, only with this destination
-    snapshot. CPython dict/list operations are atomic per-call under the GIL,
-    so the post-create writes back into these dicts (kept for readability/
-    parity with the sequential version) are safe without an explicit lock too.
-    """
     exported = {"custom_collections": [], "smart_collections": []}
 
-    # Destination lookups are loaded once and reused for all collections.
     handle_to_id = fetch_all_products_by_handle(dest_client)
     existing_custom = build_collection_lookup(fetch_all_collections(dest_client, "custom_collections"))
     existing_smart = build_collection_lookup(fetch_all_collections(dest_client, "smart_collections"))
@@ -557,7 +511,10 @@ def transfer_collections_one_by_one(
                         }
                     }))
                 except Exception as e:
-                    logger.warning("Failed to set metafield: %s", e)
+                    logger.warning(
+                        "Failed to set metafield %s.%s on collection '%s' (id %s): %s",
+                        mf.get("namespace"), mf.get("key"), title, new_coll_id, e,
+                    )
 
         except Exception as e:
             logger.error("Failed to create/update collection %s: %s", title, e)
@@ -672,7 +629,10 @@ def transfer_collections_one_by_one(
                         }
                     }))
                 except Exception as e:
-                    logger.warning("Failed to set metafield: %s", e)
+                    logger.warning(
+                        "Failed to set metafield %s.%s on collection '%s' (id %s): %s",
+                        mf.get("namespace"), mf.get("key"), title, new_coll_id, e,
+                    )
 
         except Exception as e:
             logger.error("Failed to create/update smart collection %s: %s", title, e)
@@ -681,6 +641,161 @@ def transfer_collections_one_by_one(
 
     logger.info("One-by-one transfer complete")
     return exported
+
+
+def import_collections(dest_client: ShopifyClient, exported: Dict[str, Any], max_workers: int = DEFAULT_WORKERS) -> None:
+    handle_to_id = fetch_all_products_by_handle(dest_client)
+    existing_custom = build_collection_lookup(fetch_all_collections(dest_client, "custom_collections"))
+    existing_smart = build_collection_lookup(fetch_all_collections(dest_client, "smart_collections"))
+    logger.info("Found %s products in destination store", len(handle_to_id))
+
+    custom_collections = exported.get("custom_collections", [])
+    smart_collections = exported.get("smart_collections", [])
+
+    def process_custom(c: Dict[str, Any]) -> None:
+        title = c.get("title")
+        image_path = c.get("image_local")
+
+        payload = {
+            "custom_collection": {
+                "title": c.get("title"),
+                "handle": c.get("handle"),
+                "body_html": c.get("body_html"),
+            }
+        }
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    payload["custom_collection"]["image"] = {"attachment": img_b64}
+            except Exception as e:
+                logger.warning("Failed to attach image for %s: %s", title, e)
+
+        try:
+            handle_key = (c.get("handle") or "").strip().lower()
+            title_key = (c.get("title") or "").strip().lower()
+            existing = existing_custom["by_handle"].get(handle_key) or existing_custom["by_title"].get(title_key)
+
+            if existing:
+                logger.info("Skipping creation of existing custom collection %s; syncing image", title)
+                sync_collection_image(dest_client, existing.get("id"), "custom", image_path)
+                return
+
+            result = retry_with_backoff(lambda: dest_client.rest_post("custom_collections", payload))
+            new_coll_id = result.get("custom_collection", {}).get("id")
+            logger.info("Created custom collection %s with ID %s", title, new_coll_id)
+
+            if handle_key:
+                existing_custom["by_handle"][handle_key] = {"id": new_coll_id, "title": title, "handle": c.get("handle")}
+            if title_key:
+                existing_custom["by_title"][title_key] = {"id": new_coll_id, "title": title, "handle": c.get("handle")}
+
+            for prod in c.get("products", []):
+                handle = prod.get("handle")
+                dest_id = handle_to_id.get(handle)
+                if dest_id:
+                    try:
+                        retry_with_backoff(lambda: dest_client.rest_post("collects", {
+                            "collect": {
+                                "product_id": dest_id,
+                                "collection_id": new_coll_id,
+                            }
+                        }))
+                    except Exception as e:
+                        if "already exists" in str(e).lower() or "unprocessable entity" in str(e).lower():
+                            logger.info("Product %s already assigned to collection %s", handle, title)
+                        else:
+                            logger.warning("Failed to add product %s to collection: %s", handle, e)
+                else:
+                    logger.warning("Product %s not found in destination store", handle)
+
+            for mf in c.get("metafields", []):
+                try:
+                    retry_with_backoff(lambda: dest_client.rest_post("metafields", {
+                        "metafield": {
+                            "owner_resource": "collection",
+                            "owner_id": new_coll_id,
+                            "namespace": mf.get("namespace"),
+                            "key": mf.get("key"),
+                            "value": mf.get("value"),
+                            "type": mf.get("type"),
+                        }
+                    }))
+                except Exception as e:
+                    logger.warning(
+                        "Failed to set metafield %s.%s on collection '%s' (id %s): %s",
+                        mf.get("namespace"), mf.get("key"), title, new_coll_id, e,
+                    )
+
+        except Exception as e:
+            logger.error("Failed to create/update collection %s: %s", title, e)
+
+    run_concurrently(custom_collections, process_custom, max_workers=max_workers, label="custom collection")
+
+    def process_smart(c: Dict[str, Any]) -> None:
+        title = c.get("title")
+        image_path = c.get("image_local")
+
+        payload = {
+            "smart_collection": {
+                "title": c.get("title"),
+                "handle": c.get("handle"),
+                "body_html": c.get("body_html"),
+                "rules": c.get("rules") or [],
+                "published": c.get("published", True),
+            }
+        }
+        if image_path and os.path.exists(image_path):
+            try:
+                with open(image_path, "rb") as f:
+                    img_b64 = base64.b64encode(f.read()).decode("utf-8")
+                    payload["smart_collection"]["image"] = {"attachment": img_b64}
+            except Exception as e:
+                logger.warning("Failed to attach image for %s: %s", title, e)
+
+        try:
+            handle_key = (c.get("handle") or "").strip().lower()
+            title_key = (c.get("title") or "").strip().lower()
+            existing = existing_smart["by_handle"].get(handle_key) or existing_smart["by_title"].get(title_key)
+
+            if existing:
+                logger.info("Skipping creation of existing smart collection %s; syncing image", title)
+                sync_collection_image(dest_client, existing.get("id"), "smart", image_path)
+                return
+
+            result = retry_with_backoff(lambda: dest_client.rest_post("smart_collections", payload))
+            new_coll_id = result.get("smart_collection", {}).get("id")
+            logger.info("Created smart collection %s with ID %s", title, new_coll_id)
+
+            if handle_key:
+                existing_smart["by_handle"][handle_key] = {"id": new_coll_id, "title": title, "handle": c.get("handle")}
+            if title_key:
+                existing_smart["by_title"][title_key] = {"id": new_coll_id, "title": title, "handle": c.get("handle")}
+
+            for mf in c.get("metafields", []):
+                try:
+                    retry_with_backoff(lambda: dest_client.rest_post("metafields", {
+                        "metafield": {
+                            "owner_resource": "collection",
+                            "owner_id": new_coll_id,
+                            "namespace": mf.get("namespace"),
+                            "key": mf.get("key"),
+                            "value": mf.get("value"),
+                            "type": mf.get("type"),
+                        }
+                    }))
+                except Exception as e:
+                    logger.warning(
+                        "Failed to set metafield %s.%s on collection '%s' (id %s): %s",
+                        mf.get("namespace"), mf.get("key"), title, new_coll_id, e,
+                    )
+
+        except Exception as e:
+            logger.error("Failed to create/update smart collection %s: %s", title, e)
+
+    run_concurrently(smart_collections, process_smart, max_workers=max_workers, label="smart collection")
+
+    logger.info("Import from file complete")
 
 
 def main():
@@ -703,6 +818,16 @@ def main():
         default=DEFAULT_WORKERS,
         help="Number of collections to transfer concurrently (default: %(default)s)",
     )
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed in "
+            "this mode."
+        ),
+    )
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
     args = parser.parse_args()
 
     if args.initial_limit is not None and args.initial_limit <= 0:
@@ -711,33 +836,50 @@ def main():
     if args.collection and args.initial_limit:
         logger.info("--collection provided; ignoring --initial-limit")
 
-    # Load from .env
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError("Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN")
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Build admin API URLs from shop names
-    src_host = f"{src_shop}.myshopify.com"
     dest_host = f"{dest_shop}.myshopify.com"
-
-    src_admin = admin_base_for_host(src_host)
     dest_admin = admin_base_for_host(dest_host)
-
-    src_oauth = f"https://{src_host}/admin/oauth/access_token"
     dest_oauth = f"https://{dest_host}/admin/oauth/access_token"
-
-    src_client = ShopifyClient(access_token=src_token)
-    src_client.set_shop(src_admin, src_oauth)
 
     dest_client = ShopifyClient(access_token=dest_token)
     dest_client.set_shop(dest_admin, dest_oauth)
+
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            exported = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+
+        custom_count = len(exported.get("custom_collections", []))
+        smart_count = len(exported.get("smart_collections", []))
+        logger.info("Loaded %s custom and %s smart collection(s) to import", custom_count, smart_count)
+
+        if args.execute:
+            import_collections(dest_client, exported, max_workers=args.workers)
+            logger.info("Transfer complete!")
+        else:
+            logger.info("Dry-run finished. Re-run with --execute to perform the real transfer")
+        return
+
+    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+    require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
+
+    src_host = f"{src_shop}.myshopify.com"
+    src_admin = admin_base_for_host(src_host)
+    src_oauth = f"https://{src_host}/admin/oauth/access_token"
+
+    src_client = ShopifyClient(access_token=src_token)
+    src_client.set_shop(src_admin, src_oauth)
 
     if args.execute:
         logger.info("Starting one-by-one transfer from %s to %s (%s worker(s))", src_host, dest_host, args.workers)
@@ -766,6 +908,10 @@ def main():
     out_file = out_dir / f"collections_export_src_to_dest_{ts}.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(exported, f, indent=2, ensure_ascii=False)
+
+    if args.xlsx:
+        from utils.tabular_io import export_to_xlsx
+        export_to_xlsx(exported, out_dir / f"collections_export_src_to_dest_{ts}.xlsx")
 
     logger.info("Export complete. File: %s", out_file)
     
