@@ -1,25 +1,3 @@
-"""Transfer discounts from Src to dest.
-
-Covers basic percentage/fixed-amount off (code and automatic), free shipping
-(code and automatic), and Buy X Get Y / Bxgy (code and automatic). NOT
-covered:
-- App-owned discounts (DiscountCodeApp/DiscountAutomaticApp) -- tied to
-  whatever app created them; only meaningful if that same app is installed
-  on the destination, since it owns the discount's actual logic.
-
-By default only ACTIVE/SCHEDULED discounts are transferred. Src has
-~10,000 discount nodes, the overwhelming majority of which are expired,
-auto-generated single-use affiliate codes (e.g. "KEVIN240") from a referral
-app -- migrating those would be pure noise. Pass --include-expired to widen
-that if you actually want the full historical set.
-
-Requires read_discounts/write_discounts scope on both stores.
-
-Usage:
-    python transfer_discounts.py                      # dry-run export, active/scheduled only
-    python transfer_discounts.py --execute             # create on dest
-    python transfer_discounts.py --include-expired --execute
-"""
 import argparse
 import json
 import logging
@@ -30,15 +8,16 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client, fetch_all_product_handles
-from Transfer.transfer_collections import fetch_all_collections
-from Transfer.transfer_store_metafields import retry_with_backoff, gql_quote, set_metafields
+from transfer.transfer_product import make_client, fetch_all_product_handles
+from transfer.transfer_collections import fetch_all_collections
+from transfer.transfer_store_metafields import retry_with_backoff, gql_quote, set_metafields
 from utils.shopify_graphql_utils import paginate_connection, mutation_errors, export_metafields
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_discounts")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 DISCOUNT_FRAGMENTS = """
   __typename
@@ -252,9 +231,6 @@ def normalize_customer_buys(cb: Optional[Dict[str, Any]]) -> Optional[Dict[str, 
 
 
 def normalize_customer_gets_bxgy(cg: Optional[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
-    """Bxgy's customerGets.value is DiscountOnQuantity (quantity + a nested
-    percentage/amount effect) -- a different shape from the basic discount's
-    customerGets.value (a bare DiscountPercentage/DiscountAmount)."""
     if not cg:
         return None
     value = cg.get("value") or {}
@@ -398,9 +374,6 @@ def resolve_items_literal(
     products_key: str = "productsToAdd",
     collections_key: str = "add",
 ) -> str:
-    """Build the DiscountItemsInput literal (all/products/collections) shared by
-    basic customerGets and Bxgy's customerBuys/customerGets. `products_field`
-    lets Bxgy's customerBuys use a differently-named wrapper if needed."""
     if items["kind"] == "products":
         gids = [product_handle_to_gid[h] for h in items["handles"] if h in product_handle_to_gid]
         if not gids:
@@ -475,10 +448,6 @@ def customer_gets_literal(
 
     items_literal = resolve_items_literal(cg["items"], product_handle_to_gid, collection_handle_to_gid)
 
-    # appliesOnOneTimePurchase/appliesOnSubscription must be omitted entirely (not
-    # even set to false) on a shop that doesn't have subscriptions enabled --
-    # including them at all causes Shopify to reject the whole mutation. Only
-    # emit them when the source discount was actually subscription-aware.
     subscription_fields = ""
     if cg.get("applies_on_subscription"):
         subscription_fields = (
@@ -490,8 +459,6 @@ def customer_gets_literal(
 
 
 def common_fields_literal(d: Dict[str, Any], include_code_fields: bool) -> List[str]:
-    # context is required on every discount input type; DiscountBuyerSelection has
-    # exactly one enum value (ALL), so this is the only valid non-empty context.
     fields = [
         f"title: {gql_quote(d.get('title'))}",
         f"combinesWith: {combines_with_literal(d.get('combines_with'))}",
@@ -644,7 +611,7 @@ def import_discounts(dest_client, exported: Dict[str, Any]) -> None:
             """
             mutation_name = "discountCodeBxgyCreate"
 
-        else:  # DiscountAutomaticBxgy
+        else:
             customer_buys = customer_buys_literal(d.get("customer_buys"), product_handle_to_gid, collection_handle_to_gid)
             customer_gets = customer_gets_bxgy_literal(d.get("customer_gets_bxgy"), product_handle_to_gid, collection_handle_to_gid)
             if not customer_buys or not customer_gets:
@@ -705,32 +672,53 @@ def main() -> None:
         action="store_true",
         help="Also transfer expired/disabled discounts (Src has ~10,000 mostly-expired affiliate codes; off by default)",
     )
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed in "
+            "this mode."
+        ),
+    )
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
 
-    logger.info("Exporting discounts from %s", src_shop)
-    exported = export_discounts(src_client, include_expired=args.include_expired)
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            exported = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+    else:
+        src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+        src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+        require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
 
-    ts = int(time.time())
-    out_file = out_dir / f"discounts_export_{ts}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(exported, f, indent=2, ensure_ascii=False)
-    logger.info("Export complete: %s (%s discounts)", out_file, len(exported["discounts"]))
+        src_client = make_client(src_shop, src_token)
+
+        logger.info("Exporting discounts from %s", src_shop)
+        exported = export_discounts(src_client, include_expired=args.include_expired)
+
+        ts = int(time.time())
+        out_file = out_dir / f"discounts_export_{ts}.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(exported, f, indent=2, ensure_ascii=False)
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported, out_dir / f"discounts_export_{ts}.xlsx")
+        logger.info("Export complete: %s (%s discounts)", out_file, len(exported["discounts"]))
 
     if args.execute:
         logger.info("Importing discounts into %s", dest_shop)
