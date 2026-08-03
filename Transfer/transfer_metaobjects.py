@@ -1,28 +1,3 @@
-"""Transfer Metaobject definitions and entries from Src to dest.
-
-Metaobjects are Shopify's custom structured-content records (used by apps like
-Checkout Blocks, or merchant-defined content types) -- a different resource
-from Metafields, with their own definitions and entries.
-
-Requires the `read_metaobject_definitions`/`write_metaobject_definitions` and
-`read_metaobjects`/`write_metaobjects` Admin API scopes on both stores' custom
-apps. Grant them under Shopify Admin > Apps > [app name] > Configuration, then
-reinstall to refresh the .env token.
-
-Run this BEFORE transfer_store_metafields.py: some metafield definitions
-reference a metaobject definition by GID in their validations (e.g. a
-`metaobject_reference` field), and that GID has to be remapped to the matching
-destination definition (matched by the definition's `type`, which is the
-stable identifier shared across stores) before those metafield definitions
-can be created correctly.
-
-Entries are synced with metaobjectUpsert (matched by handle), so re-running
-this script keeps the destination an exact copy of source entries.
-
-Usage:
-    python transfer_metaobjects.py                # dry-run export
-    python transfer_metaobjects.py --execute       # create/update on dest
-"""
 import argparse
 import json
 import logging
@@ -33,14 +8,15 @@ from typing import Any, Dict, List, Optional
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
-from Transfer.transfer_store_metafields import retry_with_backoff, gql_quote
+from transfer.transfer_product import make_client
+from transfer.transfer_store_metafields import retry_with_backoff, gql_quote
 from utils.shopify_graphql_utils import paginate_connection, mutation_errors
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_metaobjects")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def fetch_metaobject_definitions(client) -> List[Dict[str, Any]]:
@@ -135,7 +111,6 @@ def export_metaobjects(src_client) -> Dict[str, Any]:
 
 
 def import_metaobject_definitions(dest_client, exported_definitions: List[Dict[str, Any]]) -> Dict[str, str]:
-    """Create any missing definitions on destination. Returns source-GID -> dest-GID map."""
     existing = {d["type"]: d["id"] for d in fetch_metaobject_definitions(dest_client)}
     gid_map: Dict[str, str] = {}
 
@@ -149,11 +124,6 @@ def import_metaobject_definitions(dest_client, exported_definitions: List[Dict[s
             already_existed += 1
             continue
 
-        # Types prefixed "shopify--" are Shopify's own standard metaobject
-        # definitions (fixed schema, e.g. shopify--color-pattern). They can't be
-        # created via metaobjectDefinitionCreate ("reserved for use by another
-        # application") -- they're turned on per-store via a dedicated mutation
-        # that provisions Shopify's predefined field set itself.
         if definition["type"].startswith("shopify--"):
             mutation = f"""
             mutation {{
@@ -198,9 +168,6 @@ def import_metaobject_definitions(dest_client, exported_definitions: List[Dict[s
         try:
             result = retry_with_backoff(lambda: dest_client.mutation(mutation))
         except Exception as e:
-            # A hard GraphQL error (e.g. a namespace/type reserved by another app)
-            # raises here instead of populating userErrors -- skip just this
-            # definition rather than losing every remaining one.
             logger.warning("Failed to create metaobject definition '%s': %s", definition["type"], e)
             failed += 1
             continue
@@ -276,37 +243,58 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Transfer metaobject definitions and entries from Src to dest")
     parser.add_argument("--execute", action="store_true", help="Create/update metaobjects on the destination store")
     parser.add_argument("--out", default="Results", help="Output directory for the export JSON")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
+    parser.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import this previously-saved canonical JSON file "
+            "instead (see docs/CANONICAL_SCHEMA.md). Lets you import from a non-Shopify source "
+            "connector or replay a prior dry-run export. No SRC_SHOPIFY_* credentials needed "
+            "in this mode."
+        ),
+    )
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
 
-    logger.info("Exporting metaobjects from %s", src_shop)
-    exported = export_metaobjects(src_client)
+    if args.import_from:
+        logger.info("Loading export from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            exported = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                exported = json.load(f)
+    else:
+        src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+        src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+        require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
 
-    ts = int(time.time())
-    out_file = out_dir / f"metaobjects_export_{ts}.json"
-    with open(out_file, "w", encoding="utf-8") as f:
-        json.dump(exported, f, indent=2, ensure_ascii=False)
-    logger.info(
-        "Export complete: %s (%s definitions, %s entries)",
-        out_file,
-        len(exported["definitions"]),
-        len(exported["entries"]),
-    )
+        src_client = make_client(src_shop, src_token)
+
+        logger.info("Exporting metaobjects from %s", src_shop)
+        exported = export_metaobjects(src_client)
+
+        ts = int(time.time())
+        out_file = out_dir / f"metaobjects_export_{ts}.json"
+        with open(out_file, "w", encoding="utf-8") as f:
+            json.dump(exported, f, indent=2, ensure_ascii=False)
+        if args.xlsx:
+            from utils.tabular_io import export_to_xlsx
+            export_to_xlsx(exported, out_dir / f"metaobjects_export_{ts}.xlsx")
+        logger.info(
+            "Export complete: %s (%s definitions, %s entries)",
+            out_file,
+            len(exported["definitions"]),
+            len(exported["entries"]),
+        )
 
     if args.execute:
         logger.info("Importing metaobjects into %s", dest_shop)
