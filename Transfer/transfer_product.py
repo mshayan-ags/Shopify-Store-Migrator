@@ -1,23 +1,3 @@
-"""Transfer one or more complete products from Src to the dest store.
-
-Moves everything that makes up a product:
-- core fields (title, description, vendor, type, tags, status, handle, options)
-- images (downloaded from source, re-uploaded to destination)
-- variants (price, sku, barcode, weight, inventory policy, option values)
-- inventory quantity (best-effort, distributed across every destination location whose name matches a source location, falling back to the first destination location for unmatched names)
-- metafields at the product, variant, and image level
-
-Usage:
-    # Dry-run export of a single product by handle or numeric ID
-    python transfer_product.py --product bmw-e46-side-skirts
-
-    # Actually create/update it on the dest store
-    python transfer_product.py --product bmw-e46-side-skirts --execute
-
-    # Transfer every product in the source store
-    python transfer_product.py --all --execute 
-    python transfer_product.py --all --execute  --workers 10 --start-at 600
-"""
 import argparse
 import base64
 import json
@@ -31,8 +11,8 @@ from typing import Any, Dict, List, Optional, Tuple
 from dotenv import load_dotenv
 
 from utils.shopify_client import ShopifyClient
-from Transfer.transfer_collections import admin_base_for_host, download_image
-from Transfer.transfer_store_metafields import (
+from transfer.transfer_collections import admin_base_for_host, download_image
+from transfer.transfer_store_metafields import (
     retry_with_backoff,
     set_metafields,
     product_gid,
@@ -41,11 +21,12 @@ from Transfer.transfer_store_metafields import (
     gql_quote,
 )
 from utils.shopify_graphql_utils import run_concurrently, DEFAULT_WORKERS
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("transfer_product")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def shop_host(shop_name: str) -> str:
@@ -60,16 +41,6 @@ def make_client(shop_name: str, token: str) -> ShopifyClient:
 
 
 def fetch_all_product_handles(client: ShopifyClient) -> List[Dict[str, Any]]:
-    """Return [{"id":, "handle":}] for every product in the store.
-
-    Uses GraphQL cursor pagination, not REST's since_id pagination: REST's
-    products.json since_id walk silently stops early on stores with enough
-    products (confirmed live -- it returned 442 of 1995 real products here,
-    with no error, while GraphQL's products(first, after) connection walks
-    all 1995 correctly with the exact same token/scope). This is a REST-side
-    limitation, not a permissions issue -- always use this function instead
-    of paginating products.json directly.
-    """
     products: List[Dict[str, Any]] = []
     after_clause = ""
 
@@ -97,21 +68,6 @@ def fetch_all_product_handles(client: ShopifyClient) -> List[Dict[str, Any]]:
 
 
 def find_product_by_handle(client: ShopifyClient, handle: str) -> Optional[Dict[str, Any]]:
-    """Look up a product by exact handle via a direct, indexed productByHandle query --
-    NOT by paginating the whole catalog (fetch_all_product_handles) and filtering
-    client-side, the way this used to work.
-
-    That older approach is what caused 176 duplicate products across 120 handles
-    during a --all --execute re-run on 2026-07-30: it walks Shopify's
-    products(first:250) cursor connection (several pages for a catalog this size) on
-    every single product transfer, and that connection can silently return an
-    incomplete page set under heavy concurrent write load -- indistinguishable from
-    "this handle doesn't exist" to the caller, which then created a fresh duplicate
-    instead of updating the product that already existed. productByHandle is a
-    direct, single-call lookup by the indexed handle field and isn't subject to that
-    failure mode, and it's also far cheaper (1-2 calls instead of a full paginated
-    walk) since it doesn't need to enumerate every other product to find one.
-    """
     handle_key = (handle or "").strip().lower()
     if not handle_key:
         return None
@@ -128,7 +84,6 @@ def find_product_by_handle(client: ShopifyClient, handle: str) -> Optional[Dict[
 
 
 def find_source_product(client: ShopifyClient, identifier: str) -> Dict[str, Any]:
-    """Look up a full source product by numeric ID or handle."""
     if identifier.isdigit():
         data = retry_with_backoff(lambda: client.rest_get(f"products/{identifier}"))
         product = data.get("product")
@@ -143,12 +98,6 @@ def find_source_product(client: ShopifyClient, identifier: str) -> Dict[str, Any
 
 
 def fetch_owner_metafields(client: ShopifyClient, owner_resource: str, owner_id: int) -> List[Dict[str, Any]]:
-    """Fetch all metafields for a given REST owner_resource/owner_id with pagination.
-
-    Shopify's generic /metafields.json endpoint silently ignores bare
-    `owner_resource`/`owner_id` query params and returns unfiltered results, so the
-    filter must be namespaced as `metafield[owner_resource]` / `metafield[owner_id]`.
-    """
     metafields: List[Dict[str, Any]] = []
     since_id = 0
 
@@ -175,14 +124,6 @@ def fetch_owner_metafields(client: ShopifyClient, owner_resource: str, owner_id:
 
 
 def fetch_variant_inventory_details(src_client: ShopifyClient, product_id: int) -> Dict[int, Dict[str, Any]]:
-    """Cost/customs fields and per-location inventory live on InventoryItem, not
-    the REST variant object used everywhere else here -- fetch them for every
-    variant in one GraphQL call.
-
-    inventoryLevels is capped at the first 50 locations per variant, which
-    covers every store this pipeline has been run against; a store with more
-    locations than that would need this paginated too.
-    """
     try:
         data = retry_with_backoff(
             lambda: src_client.query(
@@ -240,7 +181,6 @@ def fetch_variant_inventory_details(src_client: ShopifyClient, product_id: int) 
 
 
 def export_product(src_client: ShopifyClient, product: Dict[str, Any], out_dir: Path) -> Dict[str, Any]:
-    """Pull a product's full details, download its images, and collect all metafields."""
     pid = product["id"]
     handle = product.get("handle") or f"product-{pid}"
     logger.info("Exporting product %s (%s)", pid, handle)
@@ -327,8 +267,6 @@ def export_product(src_client: ShopifyClient, product: Dict[str, Any], out_dir: 
     except Exception:
         logger.exception("Failed to fetch metafields for product %s", pid)
 
-    # seo, category (Shopify's standardized product taxonomy), and
-    # requiresSellingPlan are GraphQL-only -- invisible to the REST calls above.
     seo = None
     category_id = None
     requires_selling_plan = None
@@ -376,7 +314,6 @@ def export_product(src_client: ShopifyClient, product: Dict[str, Any], out_dir: 
 
 
 def build_import_payload(exported: Dict[str, Any]) -> Dict[str, Any]:
-    """Build the REST products.json creation payload from an exported product."""
     images_payload = []
     for img in exported.get("images", []):
         local_path = img.get("local_path")
@@ -458,7 +395,6 @@ def normalize_options(options: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
 
 
 def diff_product_fields(existing: Dict[str, Any], exported: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only the product-level fields whose destination value doesn't match the source."""
     updates: Dict[str, Any] = {}
 
     for field in ("title", "body_html", "vendor", "product_type"):
@@ -516,7 +452,6 @@ VARIANT_SYNC_FIELDS = [
 
 
 def diff_variant_fields(dest_variant: Dict[str, Any], src_variant: Dict[str, Any]) -> Dict[str, Any]:
-    """Return only the variant fields whose destination value doesn't match the source."""
     diff: Dict[str, Any] = {}
     for field in VARIANT_SYNC_FIELDS:
         dest_val = dest_variant.get(field)
@@ -537,7 +472,6 @@ def match_variant(
 
 
 def update_existing_product(dest_client: ShopifyClient, existing: Dict[str, Any], exported: Dict[str, Any]) -> Dict[str, Any]:
-    """Push every source field/image/variant that doesn't already match onto the existing destination product."""
     pid = existing["id"]
     title = exported.get("title")
 
@@ -566,7 +500,6 @@ def update_existing_product(dest_client: ShopifyClient, existing: Dict[str, Any]
             len(existing.get("images", [])),
             len(images_payload),
         )
-        # Shopify replaces the full image set with whatever "images" array is sent here.
         retry_with_backoff(
             lambda: dest_client.rest_put(f"products/{pid}", {"product": {"id": pid, "images": images_payload}})
         )
@@ -665,18 +598,6 @@ _locations_cache: Dict[str, Any] = {"checked": False, "location_id": None, "by_n
 
 
 def _get_cached_dest_locations(dest_client: ShopifyClient) -> Dict[str, Any]:
-    """Fetch and cache all destination locations, checking only once per run.
-
-    Missing `read_locations` scope is a permanent condition for the process's
-    lifetime, not a per-product fluke -- retrying it on every one of hundreds of
-    products would waste an API call and a full traceback per product for no
-    benefit, so the failure (or success) is remembered after the first attempt.
-
-    Returns the cache dict with "location_id" (first location, used as a
-    fallback for variants with no per-location breakdown) and "by_name" (every
-    location's id keyed by lowercased name, used to distribute inventory
-    across all locations that match a source location's name).
-    """
     if _locations_cache["checked"]:
         return _locations_cache
 
@@ -699,9 +620,6 @@ def _get_cached_dest_locations(dest_client: ShopifyClient) -> Dict[str, Any]:
 
 
 def sync_variant_inventory_item(dest_client: ShopifyClient, inventory_item_id: Optional[int], src_variant: Dict[str, Any]) -> None:
-    """Push cost and customs fields (unitCost, HS code, country/province of
-    origin) onto the destination variant's InventoryItem -- these live outside
-    the REST variant object used for everything else in this script."""
     if not inventory_item_id:
         return
 
@@ -741,16 +659,6 @@ def sync_variant_inventory_item(dest_client: ShopifyClient, inventory_item_id: O
 
 
 def sync_inventory(dest_client: ShopifyClient, exported: Dict[str, Any], variants_by_sku: Dict[str, Any], variants_by_position: Dict[Any, Any]) -> None:
-    """Push source inventory to the destination, split across every destination
-    location whose name matches a source location (run transfer_locations.py
-    --execute first so those names exist on the destination).
-
-    Falls back to the single-total behaviour (everything onto the destination's
-    first location) for any variant where the per-location breakdown couldn't
-    be fetched, or for a per-location entry whose name has no destination match
-    -- so a store not yet running multi-location transfer doesn't silently lose
-    inventory, it just concentrates it on one location like before.
-    """
     dest_locations = _get_cached_dest_locations(dest_client)
     location_id = dest_locations.get("location_id")
     if not location_id:
@@ -807,12 +715,6 @@ def sync_inventory(dest_client: ShopifyClient, exported: Dict[str, Any], variant
 
 
 def sync_graphql_only_fields(dest_client: ShopifyClient, product_id: int, exported: Dict[str, Any]) -> None:
-    """Push seo/category/requiresSellingPlan -- fields the REST product endpoints
-    used elsewhere in this script can't see or set at all.
-
-    category is a Shopify-standardized taxonomy ID (e.g. gid://shopify/TaxonomyCategory/vp-1-4)
-    shared across every store, so the source's ID is directly reusable with no remapping.
-    """
     fields = []
     if exported.get("seo_title") or exported.get("seo_description"):
         fields.append(
@@ -849,22 +751,9 @@ def sync_graphql_only_fields(dest_client: ShopifyClient, product_id: int, export
 
 
 def gql_quote_or_null(value: Optional[str]) -> str:
-    # ensure_ascii=False: see the docstring on concurrency_utils.gql_quote --
-    # the default would mangle emoji/astral characters into a GraphQL parse error.
     return json.dumps(value, ensure_ascii=False) if value else "null"
 
 
-# *_reference metafield values are Shopify GIDs, which only mean something on the
-# store that minted them. Handing a source GID straight to the destination's
-# metafieldsSet fails with a userError ("doesn't exist"), and set_metafields treats
-# that as an expected, per-item failure -- it silently drops the metafield and moves
-# on (see its docstring in transfer_store_metafields.py). That's how a real gap like
-# custom.videoimage (file_reference to a MediaImage) went missing on the destination
-# even though the source clearly had it: confirmed live via
-# verify_product_migration.py against psm-style-carbon-fiber-rear-diffuser-*.
-# The functions below resolve the source GID to something meaningful across stores
-# (handle/sku, or the file's URL) and substitute the destination's own equivalent
-# GID before the metafield is ever handed to set_metafields.
 REFERENCE_METAFIELD_TYPES = {
     "product_reference", "list.product_reference",
     "collection_reference", "list.collection_reference",
@@ -884,6 +773,10 @@ def parse_metafield_gid_list(value: Optional[str]) -> List[str]:
             parsed = json.loads(value)
             return [v for v in parsed if isinstance(v, str) and v.startswith("gid://")]
         except Exception:
+            logger.warning(
+                "Reference metafield value looks like a JSON list but failed to parse -- "
+                "treating as unresolvable, source GID(s) will NOT be remapped: %r", value[:200],
+            )
             return []
     if value.startswith("gid://"):
         return [value]
@@ -891,9 +784,6 @@ def parse_metafield_gid_list(value: Optional[str]) -> List[str]:
 
 
 def resolve_source_reference_nodes(src_client: ShopifyClient, gids: List[str]) -> Dict[str, Dict[str, Any]]:
-    """Resolve a batch of source-store GIDs to whatever identifies the same resource
-    across stores: handle for Product/Collection/Page/Metaobject, sku for
-    ProductVariant, the underlying URL for MediaImage/GenericFile/Video."""
     if not gids:
         return {}
     ids_str = ", ".join(gql_quote(g) for g in gids)
@@ -945,9 +835,6 @@ _dest_reference_gid_cache: Dict[Tuple[str, str], Optional[str]] = {}
 
 
 def find_destination_reference_gid(dest_client: ShopifyClient, info: Dict[str, Any]) -> Optional[str]:
-    """Look up the destination-store equivalent of a resolved source reference by
-    handle/sku. Cached per-process: the same product/collection/etc. is commonly
-    referenced from many metafields across many products in one run."""
     typename = info.get("typename")
     cache_key = (typename or "", info.get("handle") or info.get("sku") or "")
     if cache_key in _dest_reference_gid_cache:
@@ -1001,11 +888,6 @@ _uploaded_reference_file_cache: Dict[str, Optional[str]] = {}
 
 
 def upload_reference_file_to_destination(dest_client: ShopifyClient, typename: str, url: str) -> Optional[str]:
-    """Recreate a source file (image/generic file/video) on the destination directly
-    from its source URL via fileCreate -- Shopify fetches the URL server-side, so no
-    local download/re-upload is needed since the source URL is Shopify's own public
-    CDN. Cached per source URL for the life of the process (the same file is
-    sometimes referenced by more than one metafield)."""
     if url in _uploaded_reference_file_cache:
         return _uploaded_reference_file_cache[url]
 
@@ -1037,16 +919,8 @@ def upload_reference_file_to_destination(dest_client: ShopifyClient, typename: s
 
 
 def remap_metafield_for_destination(
-    src_client: ShopifyClient, dest_client: ShopifyClient, mf: Dict[str, Any]
+    src_client: Optional[ShopifyClient], dest_client: ShopifyClient, mf: Dict[str, Any]
 ) -> Optional[Dict[str, Any]]:
-    """Return `mf` unchanged for ordinary metafields. For *_reference types, resolve
-    the source GID(s) to the destination's own equivalent (file_reference: recreated
-    via fileCreate; product/collection/variant/page/metaobject reference: looked up
-    by handle/sku) and substitute it in. Returns None if a single-value reference
-    can't be resolved on the destination (skip rather than write a dangling
-    reference); for list-valued references, unresolvable entries are dropped and the
-    rest kept.
-    """
     mf_type = mf.get("type")
     if mf_type not in REFERENCE_METAFIELD_TYPES:
         return mf
@@ -1054,6 +928,13 @@ def remap_metafield_for_destination(
     src_gids = parse_metafield_gid_list(mf.get("value"))
     if not src_gids:
         return mf
+
+    if src_client is None:
+        logger.warning(
+            "Dropping reference metafield %s.%s -- no live source connection to resolve it (import-from mode)",
+            mf.get("namespace"), mf.get("key"),
+        )
+        return None
 
     node_info = resolve_source_reference_nodes(src_client, src_gids)
 
@@ -1083,10 +964,8 @@ def remap_metafield_for_destination(
 
 
 def prepare_metafields_for_destination(
-    src_client: ShopifyClient, dest_client: ShopifyClient, metafields: List[Dict[str, Any]]
+    src_client: Optional[ShopifyClient], dest_client: ShopifyClient, metafields: List[Dict[str, Any]]
 ) -> List[Dict[str, Any]]:
-    """Remap every reference-type metafield's value to the destination store before
-    it's handed to set_metafields; ordinary metafields pass through untouched."""
     prepared = []
     for mf in metafields:
         remapped = remap_metafield_for_destination(src_client, dest_client, mf)
@@ -1095,24 +974,10 @@ def prepare_metafields_for_destination(
     return prepared
 
 
-# transfer_collections.py only assigns product membership (via `collects`) at the
-# moment it *creates* a collection on the destination -- if the destination
-# collection already exists (the common case after the first collections run),
-# it returns early and never (re-)syncs membership for it. That's why a product
-# can be correctly transferred by transfer_product.py yet still be missing from
-# collections it belongs to on the source: confirmed live for
-# full-custom-steering-wheel-bmw-g90-m5-style, whose 20 source collections
-# (mostly manual/custom, model-specific ones) didn't carry over even though the
-# collections themselves already existed on dest. This syncs membership
-# directly from the product side instead, so re-running a product's transfer is
-# enough to fix its own membership without needing a full collections re-run.
 _dest_collection_cache: Dict[str, Optional[Tuple[int, bool]]] = {}
 
 
 def resolve_destination_collection(dest_client: ShopifyClient, handle: str) -> Optional[Tuple[int, bool]]:
-    """Look up a destination collection by handle. Returns (numeric_id, is_smart) or
-    None if no collection with that handle exists on the destination. Cached by
-    handle for the life of the process -- many products share the same collections."""
     if handle in _dest_collection_cache:
         return _dest_collection_cache[handle]
 
@@ -1135,7 +1000,6 @@ def resolve_destination_collection(dest_client: ShopifyClient, handle: str) -> O
 
 
 def fetch_source_product_collection_handles(src_client: ShopifyClient, product_id: int) -> List[str]:
-    """Every collection (custom or smart) the source product currently belongs to."""
     handles: List[str] = []
     after_clause = ""
     while True:
@@ -1159,13 +1023,6 @@ def fetch_source_product_collection_handles(src_client: ShopifyClient, product_i
 def sync_product_collections(
     src_client: ShopifyClient, dest_client: ShopifyClient, src_product_id: int, dest_product_id: int
 ) -> None:
-    """Add the destination product to every manual (non-rule-based) collection its
-    source counterpart belongs to. Smart collections are deliberately left untouched
-    -- Shopify computes their membership from the collection's own rules, and there
-    is no valid way to force a product into one; if a product is missing from a
-    smart collection on the destination, the fix is in the collection's rules or the
-    product's own data (tags/type/vendor), not here.
-    """
     handles = fetch_source_product_collection_handles(src_client, src_product_id)
     added = already_member = smart_skipped = not_found = failed = 0
 
@@ -1203,7 +1060,7 @@ def sync_product_collections(
     )
 
 
-def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, exported: Dict[str, Any]) -> Dict[str, Any]:
+def import_product(src_client: Optional[ShopifyClient], dest_client: ShopifyClient, exported: Dict[str, Any]) -> Dict[str, Any]:
     handle = exported.get("handle")
     existing = find_existing_destination_product(dest_client, handle)
 
@@ -1233,7 +1090,6 @@ def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, export
     variants_by_sku = {(v.get("sku") or "").strip().lower(): v for v in new_variants if v.get("sku")}
     variants_by_position = {v.get("position"): v for v in new_variants}
 
-    # Assign images to variants based on the source's variant -> image position mapping
     if not existing:
         for src_variant in exported.get("variants", []):
             image_position = src_variant.get("image_position")
@@ -1260,7 +1116,6 @@ def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, export
 
         sync_inventory(dest_client, exported, variants_by_sku, variants_by_position)
 
-    # Product-level metafields
     if exported.get("metafields"):
         prepared = prepare_metafields_for_destination(src_client, dest_client, exported["metafields"])
         result = set_metafields(dest_client, product_gid(new_pid), prepared)
@@ -1268,7 +1123,6 @@ def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, export
             "Product metafields: %s updated, %s skipped", result["updated_count"], result["skipped_count"]
         )
 
-    # Variant-level metafields and inventory item details (cost, customs fields)
     for src_variant in exported.get("variants", []):
         dest_variant = (
             variants_by_sku.get((src_variant.get("sku") or "").strip().lower())
@@ -1291,7 +1145,6 @@ def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, export
 
         sync_variant_inventory_item(dest_client, dest_variant.get("inventory_item_id"), src_variant)
 
-    # Image-level metafields
     for src_image in exported.get("images", []):
         if not src_image.get("metafields"):
             continue
@@ -1308,8 +1161,13 @@ def import_product(src_client: ShopifyClient, dest_client: ShopifyClient, export
             result["skipped_count"],
         )
 
-    if exported.get("id"):
+    if exported.get("id") and src_client is not None:
         sync_product_collections(src_client, dest_client, exported["id"], new_pid)
+    elif exported.get("id"):
+        logger.warning(
+            "Skipping collection-membership sync for '%s' -- no live source connection (import-from mode)",
+            exported.get("title"),
+        )
 
     return new_product
 
@@ -1320,6 +1178,7 @@ def transfer_one(
     out_dir: Path,
     identifier: str,
     execute: bool,
+    write_xlsx: bool = False,
 ) -> Dict[str, Any]:
     product = find_source_product(src_client, identifier)
     exported = export_product(src_client, product, out_dir)
@@ -1328,6 +1187,10 @@ def transfer_one(
     out_file = out_dir / f"product_export_{exported['handle']}_{ts}.json"
     with open(out_file, "w", encoding="utf-8") as f:
         json.dump(exported, f, indent=2, ensure_ascii=False)
+
+    if write_xlsx:
+        from utils.tabular_io import export_to_xlsx
+        export_to_xlsx(exported, out_dir / f"product_export_{exported['handle']}_{ts}.xlsx")
 
     logger.info(
         "Product '%s': %s image(s), %s variant(s), %s product metafield(s). Export: %s",
@@ -1359,8 +1222,20 @@ def main() -> None:
     group = parser.add_mutually_exclusive_group(required=True)
     group.add_argument("--product", help="Source product ID or handle to transfer")
     group.add_argument("--all", action="store_true", help="Transfer every product in the source store")
+    group.add_argument(
+        "--import-from",
+        help=(
+            "Skip the source export step and import product(s) from this previously-saved canonical "
+            "JSON file instead (a single product dict, or a list of them -- see docs/CANONICAL_SCHEMA.md). "
+            "Lets you import from a non-Shopify source connector (Wix/BigCommerce/a database), or replay a "
+            "prior dry-run export, without a live source Shopify store. No SRC_SHOPIFY_* credentials needed "
+            "in this mode, but reference-type metafields and collection-membership sync are skipped since "
+            "those require a live source connection."
+        ),
+    )
     parser.add_argument("--execute", action="store_true", help="Perform the real import into the destination store")
     parser.add_argument("--out", default="Results", help="Output directory for export JSON and downloaded images")
+    parser.add_argument("--xlsx", action="store_true", help="Also write an .xlsx workbook alongside the .json export")
     parser.add_argument("--limit", type=int, default=None, help="With --all, only transfer the first N products")
     parser.add_argument(
         "--start-at",
@@ -1376,21 +1251,48 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
-    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
-
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
+
+    if args.import_from:
+        logger.info("Loading product export(s) from %s (skipping source fetch)", args.import_from)
+        if args.import_from.lower().endswith(".xlsx"):
+            from utils.tabular_io import import_from_xlsx
+            loaded = import_from_xlsx(args.import_from)
+        else:
+            with open(args.import_from, "r", encoding="utf-8") as f:
+                loaded = json.load(f)
+        products = loaded if isinstance(loaded, list) else [loaded]
+        logger.info("Loaded %s product(s) to import", len(products))
+
+        for exported in products:
+            try:
+                if args.execute:
+                    new_product = import_product(None, dest_client, exported)
+                    logger.info(
+                        "Transfer complete for '%s'. Destination product id: %s, handle: %s",
+                        exported.get("title"), new_product.get("id"), new_product.get("handle"),
+                    )
+                else:
+                    logger.info(
+                        "Dry-run: would import '%s'. Re-run with --execute to write it to the destination store.",
+                        exported.get("title"),
+                    )
+            except Exception:
+                logger.exception("Failed to import product '%s'", exported.get("title"))
+        return
+
+    src_shop = os.getenv("SRC_SHOPIFY_SHOP")
+    src_token = os.getenv("SRC_SHOPIFY_ACCESS_TOKEN")
+    require_env(SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token)
+
+    src_client = make_client(src_shop, src_token)
 
     if args.all:
         entries = fetch_all_product_handles(src_client)
@@ -1418,14 +1320,14 @@ def main() -> None:
                 position = completed
             logger.info("[%s/%s] %s", position, len(entries), identifier)
             try:
-                transfer_one(src_client, dest_client, out_dir, identifier, args.execute)
+                transfer_one(src_client, dest_client, out_dir, identifier, args.execute, write_xlsx=args.xlsx)
             except Exception:
                 logger.exception("Failed to transfer product %s", identifier)
 
         logger.info("Using %s worker(s)", args.workers)
         run_concurrently(entries, process, max_workers=args.workers, label="product")
     else:
-        transfer_one(src_client, dest_client, out_dir, args.product, args.execute)
+        transfer_one(src_client, dest_client, out_dir, args.product, args.execute, write_xlsx=args.xlsx)
 
 
 if __name__ == "__main__":
