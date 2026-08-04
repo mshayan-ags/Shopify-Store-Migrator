@@ -1,0 +1,128 @@
+# =============================================================================
+# Sources/postgresql/mapping.example.yaml
+#
+# This file IS the documentation for how to configure the PostgreSQL source
+# connector against your own database. Copy it (e.g. to `mapping.yaml`),
+# adapt every `table:`/`columns:` line below to your own schema, then run:
+#
+#   python -m Sources.postgresql.main --mapping mapping.yaml --resource products --out Results
+#
+# WHY THIS FILE EXISTS
+# ---------------------
+# A raw PostgreSQL database has no fixed "product"/"customer"/"order" schema
+# of its own -- unlike a real e-commerce platform's API, table and column
+# names are whatever your app happens to call them. So this connector cannot
+# hardcode anything; instead, every canonical resource below is described as
+# "read from THIS table (or a full SELECT query), and THESE source columns map
+# to THESE canonical field names."
+#
+# The four top-level sections are the canonical resources this connector
+# knows how to produce (see docs/CANONICAL_SCHEMA.md for the exact JSON shape
+# each one turns into). All four are optional -- only include the ones your
+# database actually has data for. Run with `--resource products` (etc.) to
+# export just one, or `--resource all` to export every section present here.
+# =============================================================================
+
+products:
+  # `table:` is the simplest option -- the connector runs `SELECT * FROM
+  # <table>` and reads whichever source columns you name below out of each
+  # row. Table/column names here are validated as plain SQL identifiers
+  # (letters/digits/underscore, must start with a letter or underscore)
+  # before ever touching a query, so a typo fails loudly instead of silently
+  # querying the wrong thing.
+  table: shop_products
+
+  # If your product data is normalized across multiple tables (e.g. category
+  # name lives in a separate `categories` table), swap `table:` for a `query:`
+  # key instead and hand-write the full SELECT with whatever JOINs you need,
+  # e.g.:
+  #   query: >
+  #     SELECT p.*, c.name AS category_name
+  #     FROM shop_products p
+  #     LEFT JOIN shop_categories c ON c.id = p.category_id
+  # A `query:` is used completely as-written (no identifier validation is
+  # possible or needed since you control its literal text) -- only ever point
+  # this connector at a mapping file you trust.
+
+  # `columns:` maps CANONICAL FIELD NAME (left, fixed -- see
+  # docs/CANONICAL_SCHEMA.md's `product` section) to SOURCE COLUMN NAME
+  # (right, from your table/query). Every key here is optional -- omit a
+  # canonical field entirely (or map it to `null`) if your source has no
+  # equivalent; the export will just leave that field unset (`None`), which
+  # every `import_*` function already treats as "leave unset."
+  columns:
+    handle: slug                 # url slug -- must be unique per store
+    title: product_name
+    body_html: description       # HTML allowed
+    vendor: brand
+    product_type: category_name
+    tags: null                   # this source has no tagging concept -- left unset
+    status: is_active            # raw value translated via `transforms:` below
+
+  # `transforms:` lets you translate raw DB values into the exact strings
+  # Shopify/the canonical schema expects, per canonical field. Keys under
+  # each field are matched against `str(raw_value)` (so this works whether
+  # the column is an integer, boolean, or text column), and any value NOT
+  # listed here is passed through unchanged.
+  transforms:
+    status:
+      "1": active     # canonical `status` must be one of: active | draft | archived
+      "0": draft
+
+  # A product can have 1..N variants, normally stored as separate rows in a
+  # separate table. Same `table:`/`query:` + `columns:` shape as above, plus:
+  #   foreign_key: the column in THIS variants table that references the
+  #                parent product's `id` column in `shop_products` -- used to
+  #                group variant rows under the correct parent product.
+  # Any VariantExport field (see docs/CANONICAL_SCHEMA.md) can be mapped here,
+  # not just the four shown -- e.g. add `option1: size_label` if you have it.
+  variants:
+    table: shop_product_variants
+    foreign_key: product_id
+    columns:
+      sku: sku_code
+      price: unit_price
+      inventory_quantity: stock_count
+      barcode: upc
+
+collections:
+  table: shop_categories
+  # The compact `{a: b, c: d}` inline-mapping style works too -- YAML doesn't
+  # care whether you write a mapping across multiple lines or on one.
+  columns: {handle: slug, title: name, body_html: description}
+
+  # Which products belong to which collection, when that's stored as a
+  # separate many-to-many join table (the common case). If your database has
+  # no such join table, just omit `product_membership:` entirely and every
+  # collection will export with an empty `products` list (you can still
+  # populate it by hand, or manage collection membership on the Shopify side).
+  product_membership:
+    table: shop_product_categories       # the join table
+    product_id_column: product_id        # column in the join table -> shop_products.id
+    collection_id_column: category_id    # column in the join table -> shop_categories.id
+    # (Product handles for the exported `products: [{id, handle}, ...]` list
+    # are looked up from THIS mapping file's own `products:` section above --
+    # so if you use `product_membership:`, make sure `products:` is also
+    # configured with a `columns.handle` entry, or handles will come back as
+    # null.)
+
+customers:
+  table: shop_customers
+  columns: {email: email_address, first_name: fname, last_name: lname, phone: phone_number}
+  # `email` is the one REQUIRED canonical customer field -- it's the only
+  # cross-store matching key used everywhere downstream (orders, draft
+  # orders, gift cards, B2B contacts). Make sure it's mapped to a real column.
+
+orders:
+  table: shop_orders
+  columns: {name: order_number, email: customer_email, currency: currency_code}
+
+  # Line items, same shape as `products.variants` above: a separate table,
+  # `foreign_key` naming the column that references the parent order's `id`.
+  # `sku` should be populated if at all possible -- line items are matched to
+  # a destination product variant BY SKU on import; an unmatched/missing SKU
+  # falls back to a custom/manual line item with just a title and price.
+  line_items:
+    table: shop_order_items
+    foreign_key: order_id
+    columns: {sku: sku_code, title: item_name, quantity: qty, price: unit_price}
