@@ -1,24 +1,3 @@
-"""Audit-only report of staff accounts -- NOT a transfer script.
-
-This is NOT automatable. There is no documented Admin API mutation to
-create or invite a staff member -- invitations are email-based and only
-issued through the Shopify admin UI, almost certainly a deliberate security
-restriction (an API-created account with arbitrary permissions would be a
-major attack surface). `StaffMember` also has no granular permissions field
-exposed via the Admin API -- role/permission sets are admin-UI-only too.
-Nothing here can be written to the destination store.
-
-What this script actually does: reads the `staffMembers` list on the source
-store (name, email, active flag, account type, whether they're the shop
-owner) via the Admin API, and reports it as a checklist of who needs to be
-manually re-invited on dest with equivalent permissions.
-
-Requires `read_staff_members` (or the store-owner token) on the source
-store's custom app.
-
-Usage:
-    python audit_staff_accounts.py
-"""
 import json
 import logging
 import os
@@ -28,13 +7,14 @@ from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
+from transfer.transfer_product import make_client
 from utils.shopify_graphql_utils import paginate_connection
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("audit_staff_accounts")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 
 def fetch_staff_members(client) -> List[Dict[str, Any]]:
@@ -82,10 +62,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     out_dir = Path("Results")
     out_dir.mkdir(parents=True, exist_ok=True)
