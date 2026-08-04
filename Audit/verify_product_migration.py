@@ -1,28 +1,3 @@
-"""Verify that products transferred from Src to dest are an exact match.
-
-Read-only comparison tool -- writes nothing to either store. For each product it
-re-fetches fresh data from BOTH stores (not the local Results/ export snapshots,
-which can go stale) and diffs every field transfer_product.py is supposed to have
-copied: core fields, options, SEO, category, requiresSellingPlan, every variant
-(price/sku/barcode/weight/inventory policy/cost & customs fields), images
-(count/position/alt, optionally byte-identical content), and metafields at the
-product, variant, and image level.
-
-Usage:
-    # Spot-check one product by source handle or numeric ID
-    python verify_product_migration.py --product bmw-e46-side-skirts
-
-    # Verify every product that exists on the source store
-    python verify_product_migration.py --all
-
-    # Resume a large run, and byte-compare images too (slower -- downloads
-    # every image from both stores)
-    python verify_product_migration.py --all --start-at 500 --deep-images
-
-Outputs (under --out, default "Results"):
-    product_verification_report.json  -- full machine-readable diff, one entry per product
-    product_verification_report.xlsx -- Summary + Details sheets for human review
-"""
 import argparse
 import hashlib
 import json
@@ -37,7 +12,7 @@ import xlsxwriter
 from dotenv import load_dotenv
 
 from utils.shopify_client import ShopifyClient
-from Transfer.transfer_product import (
+from transfer.transfer_product import (
     make_client,
     fetch_all_product_handles,
     find_source_product,
@@ -48,11 +23,12 @@ from Transfer.transfer_product import (
     normalize_options,
 )
 from utils.concurrency_utils import retry_with_backoff, run_concurrently, DEFAULT_WORKERS
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("verify_product_migration")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 CORE_FIELDS = [
     "title", "body_html", "vendor", "product_type", "template_suffix",
@@ -66,11 +42,6 @@ VARIANT_FIELDS = [
     "country_code_of_origin", "harmonized_system_code", "province_code_of_origin",
 ]
 
-# The full set of product-level metafields product_uploader.py._prepare_metafields()
-# actually writes (grounded in that file, not guessed). Each is conditional on the
-# AI-optimized JSON having that section, so absence on a given source product isn't
-# necessarily a bug -- this is coverage visibility, not a pass/fail check. See
-# Docs/PRODUCT_VERIFICATION_CHECKLIST.md for the source JSON path each key maps from.
 CANONICAL_PRODUCT_METAFIELD_KEYS = [
     ("custom", "installation_video"),
     ("custom", "description"),
@@ -109,8 +80,6 @@ CANONICAL_PRODUCT_METAFIELD_KEYS = [
 
 
 def fetch_product_snapshot(client: ShopifyClient, product: Dict[str, Any]) -> Dict[str, Any]:
-    """Collect the same fields transfer_product.py's export_product does, minus
-    downloading images to disk (this tool only needs to diff them, not re-upload)."""
     pid = product["id"]
 
     images = []
@@ -211,12 +180,6 @@ def metafield_key(mf: Dict[str, Any]) -> Tuple[str, str]:
     return (mf.get("namespace"), mf.get("key"))
 
 
-# *_reference metafield values are Shopify GIDs, which are store-specific by
-# construction -- a correctly-migrated reference metafield MUST have a different raw
-# value on the destination (it points at the destination's copy of that resource).
-# Comparing raw GID strings would flag every one of these as a false-positive mismatch,
-# so instead they're resolved to a cross-store-comparable identifier (handle/sku/url)
-# and compared on that.
 REFERENCE_METAFIELD_TYPES = {
     "product_reference", "list.product_reference",
     "collection_reference", "list.collection_reference",
@@ -243,16 +206,10 @@ def parse_gid_list(value: Optional[str]) -> List[str]:
 
 
 def normalize_file_identifier(url: str) -> str:
-    """A re-uploaded file's URL will never match the source's byte-for-byte -- it
-    lives under a different shop's CDN path, and Shopify appends a fresh `?v=`
-    cache-busting param on every upload. The filename itself is what's actually
-    comparable across stores."""
     return url.split("?", 1)[0].rsplit("/", 1)[-1]
 
 
 def resolve_gid_identifiers(client: ShopifyClient, gids: List[str]) -> Dict[str, str]:
-    """Resolve a batch of GIDs (any of Product/Variant/Collection/Page/Metaobject/File)
-    to a stable identifier that's meaningful across different stores."""
     if not gids:
         return {}
     ids_str = ", ".join(f'"{g}"' for g in gids)
@@ -287,8 +244,6 @@ def resolve_gid_identifiers(client: ShopifyClient, gids: List[str]) -> Dict[str,
 def resolve_reference_changes(
     candidates: List[Dict[str, Any]], src_client: ShopifyClient, dest_client: ShopifyClient
 ) -> List[Dict[str, Any]]:
-    """Re-check raw-value mismatches on reference-type metafields by resolved identifier
-    instead of raw GID. Returns only the ones that are still genuinely different."""
     still_changed = []
     for entry in candidates:
         src_gids = parse_gid_list(entry["source_value"])
@@ -309,7 +264,6 @@ def diff_metafields(
     src_client: Optional[ShopifyClient] = None,
     dest_client: Optional[ShopifyClient] = None,
 ) -> Dict[str, Any]:
-    """namespace+key identifies a metafield across stores (ids never match across shops)."""
     src_by_key = {metafield_key(m): m for m in src_mfs}
     dest_by_key = {metafield_key(m): m for m in dest_mfs}
 
@@ -480,8 +434,6 @@ def verify_one(src_client: ShopifyClient, dest_client: ShopifyClient, identifier
             variant_reports.append({
                 "sku": sv.get("sku") or sv.get("title"),
                 "field_mismatches": field_diff,
-                # Known pipeline limitation: inventory only syncs to destination's first
-                # location, so this is reported but doesn't count toward pass/fail.
                 "inventory_quantity_note": inv_diff,
                 "metafield_diff": mf_diff,
             })
@@ -663,10 +615,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
