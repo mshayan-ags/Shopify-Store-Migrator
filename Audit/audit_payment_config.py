@@ -1,26 +1,3 @@
-"""Audit-only report of payment configuration -- NOT a transfer script.
-
-This is NOT automatable. There is no documented Admin API query or mutation
-that lists or configures a store's payment gateways/providers (Shopify
-Payments setup, third-party gateways, manual payment methods) -- merchants
-have consistently asked for this and Shopify has never exposed it, almost
-certainly because it touches live financial/banking configuration. Nothing
-here can be written to the destination store.
-
-What this script actually reads (the only payment-adjacent fields the Admin
-API exposes): the shop's currency, enabled presentment currencies, and
-`paymentSettings.supportedDigitalWallets` (Apple/Google Pay etc.) --
-informational only, not something payments can be "created" from.
-
-The actual payment gateway setup (which processor is connected, bank/payout
-details, manual payment method text) has to be recreated by hand: go to
-Settings > Payments on dest and configure each provider used on
-Src, then re-enter any real credentials directly (never paste them
-into this tool or its output).
-
-Usage:
-    python audit_payment_config.py
-"""
 import json
 import logging
 import os
@@ -30,13 +7,14 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
+from transfer.transfer_product import make_client
 from utils.concurrency_utils import retry_with_backoff
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("audit_payment_config")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 QUERY = """
 query {
@@ -68,10 +46,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     out_dir = Path("Results")
     out_dir.mkdir(parents=True, exist_ok=True)
