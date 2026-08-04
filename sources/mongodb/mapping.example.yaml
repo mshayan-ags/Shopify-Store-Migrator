@@ -1,0 +1,138 @@
+# mapping.example.yaml
+#
+# A raw MongoDB database has no fixed "product"/"customer"/"order" schema of
+# its own -- collection names, field names, and document shape are entirely up
+# to whoever built the app this database backs. This file is how you tell the
+# mongodb source connector ("Sources/mongodb/") which MongoDB collection, and
+# which fields on its documents, correspond to each CANONICAL resource and
+# field documented in docs/CANONICAL_SCHEMA.md.
+#
+# Top-level keys are canonical resource names: products, collections,
+# customers, orders. Every one of them is OPTIONAL -- omit a section entirely
+# if you don't want to export that resource. Run with e.g.:
+#
+#   python -m Sources.mongodb.main --mapping Sources/mongodb/mapping.example.yaml --resource products --out Results/mongodb_products.json
+#
+# Each resource section needs at minimum a `collection:` key (the Mongo
+# collection to read from) and a `fields:` key (a mapping of
+# CANONICAL_FIELD_NAME: your_mongo_field_name). Field names on the right-hand
+# side support DOT NOTATION to reach into nested subdocuments -- Mongo
+# documents are naturally nested (unlike a flat SQL row), so a field doesn't
+# have to live at the top level of the document. For example
+# `body_html: description.html` means: read `doc["description"]["html"]` and
+# use it as the canonical `body_html` value. If an intermediate key is
+# missing (e.g. the document has no "description" subdocument at all), the
+# resolved value is simply `None` rather than raising an error.
+#
+# `transforms:` (optional, per-resource) lets you remap raw field VALUES to
+# the canonical vocabulary Shopify expects (e.g. canonical `status` must be
+# exactly "active"/"draft"/"archived", but your app might store a plain
+# boolean `isActive` flag instead). Keys under a field name are matched as
+# STRINGS against the raw value (so a Mongo boolean `true` is matched via the
+# YAML string key `"true"`) and replaced with the mapped value; anything not
+# listed is passed through unchanged.
+#
+# THE ONE MONGODB-SPECIFIC CONCEPT A POSTGRES PERSON WOULDN'T EXPECT:
+# products commonly EMBED their variants directly as an array field on the
+# product document (no separate "variants collection" needed), and orders
+# commonly embed their line items the same way. But some schemas instead keep
+# variants/line_items in their OWN collection, with each variant document
+# holding a foreign-key-style field pointing back at its parent's `_id` --
+# this mirrors how the sibling Postgres connector (Sources/postgresql/) joins
+# a separate variants table. This mapping file supports BOTH shapes for a
+# resource's nested items:
+#
+#   embedded_field: <name>              # pull the array straight off the parent document
+#     -- OR --
+#   collection: <name>                  # query this separate collection instead
+#   foreign_key: <field on the CHILD>   # ...filtered to where this field == the parent's _id
+#
+# Set exactly one of these per nested-items block (embedded_field, or
+# collection+foreign_key) depending on how your schema stores that data.
+
+products:
+  # The MongoDB collection holding product documents.
+  collection: products
+  fields:
+    handle: slug                    # canonical "handle" <- doc["slug"]
+    title: name
+    body_html: description.html     # dot-notation: doc["description"]["html"]
+    vendor: brand
+    product_type: category
+    status: isActive                # raw boolean -- remapped below via `transforms`
+  # Optional: remap raw field VALUES (matched as strings) to Shopify's
+  # canonical vocabulary. Here the app stores a boolean `isActive` flag on
+  # each product, but canonical `status` must be "active"/"draft"/"archived".
+  transforms:
+    status:
+      "true": active
+      "false": draft
+  # Variants: this example schema EMBEDS them as an array field on the
+  # product document itself (no separate variants collection).
+  variants:
+    embedded_field: variants        # doc["variants"] is a list of variant subdocuments
+    fields:
+      sku: skuCode
+      price: pricing.amount         # dot-notation reaches into a nested subdocument per variant
+      inventory_quantity: stock.available
+      barcode: upc
+  # --- Alternative shape (NOT used in this example, shown for reference) ---
+  # If your variants instead live in their own collection, referencing their
+  # parent product by id, use this shape instead of `embedded_field`:
+  #
+  # variants:
+  #   collection: product_variants
+  #   foreign_key: productId        # field on each VARIANT document holding the parent product's _id
+  #   fields:
+  #     sku: skuCode
+  #     price: pricing.amount
+  #     inventory_quantity: stock.available
+  #     barcode: upc
+
+collections:
+  # The MongoDB collection holding category/collection documents.
+  collection: categories
+  fields:
+    handle: slug
+    title: name
+    body_html: description
+  # Mongo products commonly reference their category directly via an id
+  # field on the PRODUCT document, rather than through a join/membership
+  # table like a relational schema would use. Name that field here so the
+  # connector can find every product whose `categoryId` matches this
+  # collection's `_id`.
+  product_membership:
+    product_field_referencing_collection: categoryId
+
+customers:
+  collection: customers
+  fields:
+    email: emailAddress             # REQUIRED by the canonical schema -- must resolve to a real value
+    first_name: firstName
+    last_name: lastName
+    phone: phoneNumber
+
+orders:
+  collection: orders
+  fields:
+    name: orderNumber
+    email: customerEmail
+    currency: currencyCode
+  # Line items: this example schema embeds them directly on the order
+  # document, same idea as `variants` above.
+  line_items:
+    embedded_field: items            # doc["items"] is a list of line-item subdocuments
+    fields:
+      sku: skuCode
+      title: itemName
+      quantity: qty
+      price: unitPrice
+  # --- Alternative shape (NOT used in this example, shown for reference) ---
+  # line_items:
+  #   collection: order_items
+  #   foreign_key: orderId           # field on each LINE ITEM document holding the parent order's _id
+  #   fields:
+  #     sku: skuCode
+  #     title: itemName
+  #     quantity: qty
+  #     price: unitPrice
