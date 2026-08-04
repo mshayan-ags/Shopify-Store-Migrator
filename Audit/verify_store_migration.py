@@ -1,36 +1,3 @@
-"""Verify every non-product resource transferred from Src to dest matches.
-
-Read-only -- writes nothing to either store. Companion to verify_product_migration.py
-(which covers products specifically); this covers everything else the migration
-pipeline moves: collections, pages, blogs/articles, navigation menus, customers,
-redirects, discounts, orders, and shop policies. Locations are attempted but will
-report BLOCKED if the read_locations scope isn't granted (a known, documented gap).
-
-Special emphasis on collections: every collection's handle IS its storefront URL
-(/collections/<handle>), so an exact handle match between source and destination is
-checked explicitly and surfaced as its own top-level pass/fail, not buried in a
-generic field diff.
-
-Usage:
-    # Everything
-    python verify_store_migration.py --all
-
-    # Just one resource
-    python verify_store_migration.py --resource collections
-    python verify_store_migration.py --resource pages
-    python verify_store_migration.py --resource blogs
-    python verify_store_migration.py --resource navigation
-    python verify_store_migration.py --resource customers
-    python verify_store_migration.py --resource redirects
-    python verify_store_migration.py --resource discounts
-    python verify_store_migration.py --resource orders
-    python verify_store_migration.py --resource policies
-    python verify_store_migration.py --resource locations
-
-Outputs (under --out, default "Results"):
-    store_verification_report.json  -- full machine-readable diff, one section per resource
-    store_verification_report.xlsx  -- one sheet per resource: Summary + Details
-"""
 import argparse
 import json
 import logging
@@ -42,27 +9,37 @@ import xlsxwriter
 from dotenv import load_dotenv
 
 from utils.shopify_client import ShopifyClient
-from Transfer.transfer_product import make_client
+from transfer.transfer_product import make_client
 from utils.concurrency_utils import retry_with_backoff
 from utils.shopify_graphql_utils import paginate_connection
 
-from Transfer.transfer_pages import fetch_all_pages
-from Transfer.transfer_blogs import fetch_all_blogs, fetch_blog_articles
-from Transfer.transfer_navigation import fetch_all_menus
-from Transfer.transfer_customers import fetch_all_customers
-from Transfer.transfer_redirects import fetch_all_redirects
-from Transfer.transfer_discounts import fetch_discount_nodes
-from Transfer.transfer_orders import fetch_all_orders
-from Transfer.transfer_policies import fetch_shop_policies
+from transfer.transfer_pages import fetch_all_pages
+from transfer.transfer_blogs import fetch_all_blogs, fetch_blog_articles
+from transfer.transfer_navigation import fetch_all_menus
+from transfer.transfer_customers import fetch_all_customers
+from transfer.transfer_redirects import fetch_all_redirects
+from transfer.transfer_discounts import fetch_discount_nodes
+from transfer.transfer_orders import fetch_all_orders
+from transfer.transfer_policies import fetch_shop_policies
+from transfer.transfer_draft_orders import fetch_all_draft_orders
+from transfer.transfer_gift_cards import fetch_all_gift_cards
+from transfer.transfer_b2b import fetch_all_companies
+from transfer.transfer_markets import fetch_all_markets
+from transfer.transfer_files import export_files
+from transfer.transfer_selling_plans import export_selling_plan_groups
+from transfer.transfer_customer_segments import export_segments
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("verify_store_migration")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 ALL_RESOURCES = [
     "collections", "pages", "blogs", "navigation", "customers",
     "redirects", "discounts", "orders", "policies", "locations",
+    "draft_orders", "gift_cards", "b2b", "markets", "files",
+    "selling_plans", "customer_segments",
 ]
 
 
@@ -70,20 +47,7 @@ def diff_value(s: Any, d: Any) -> bool:
     return (s or None) != (d or None)
 
 
-# ---------------------------------------------------------------------------
-# Collections -- URL/handle parity is the headline check here.
-# ---------------------------------------------------------------------------
-
 def fetch_all_collections_reliable(client: ShopifyClient) -> List[Dict[str, Any]]:
-    """Direct GraphQL cursor pagination for collections.
-
-    Deliberately NOT transfer_collections.py's fetch_all_collections (REST
-    custom_collections/smart_collections with since_id pagination) -- this
-    codebase's own transfer_store_metafields.py docstring documents REST since_id
-    pagination silently under-returning on this exact store pairing (442 of 1995
-    real products, confirmed live), so a verification tool has no business trusting
-    the same pagination style it already knows is unreliable at scale.
-    """
     def build_query(after_clause: str) -> str:
         return f"""
         {{ collections(first: 100{after_clause}) {{
@@ -146,10 +110,6 @@ def compare_collections(src_client: ShopifyClient, dest_client: ShopifyClient) -
         if diff:
             mismatches.append({"handle": handle, "field_mismatches": diff})
 
-    # The headline check the user explicitly asked for: since matching is by exact
-    # handle string, every entry that's neither missing nor extra has, by
-    # construction, an identical handle -- so the storefront URL /collections/<handle>
-    # is identical on both stores for every one of them.
     matched_count = len(set(src_by_handle) & set(dest_by_handle))
 
     return {
@@ -162,10 +122,6 @@ def compare_collections(src_client: ShopifyClient, dest_client: ShopifyClient) -
         "mismatches": mismatches,
     }
 
-
-# ---------------------------------------------------------------------------
-# Pages
-# ---------------------------------------------------------------------------
 
 def compare_pages(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {p["handle"]: p for p in fetch_all_pages(src_client)}
@@ -201,10 +157,6 @@ def compare_pages(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict
         "mismatches": mismatches,
     }
 
-
-# ---------------------------------------------------------------------------
-# Blogs + articles
-# ---------------------------------------------------------------------------
 
 def compare_blogs(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_blogs = fetch_all_blogs(src_client)
@@ -281,10 +233,6 @@ def compare_blogs(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict
     }
 
 
-# ---------------------------------------------------------------------------
-# Navigation menus
-# ---------------------------------------------------------------------------
-
 def compare_navigation(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {m["handle"]: m for m in fetch_all_menus(src_client)}
     dest_by = {m["handle"]: m for m in fetch_all_menus(dest_client)}
@@ -316,10 +264,6 @@ def compare_navigation(src_client: ShopifyClient, dest_client: ShopifyClient) ->
     }
 
 
-# ---------------------------------------------------------------------------
-# Customers
-# ---------------------------------------------------------------------------
-
 def compare_customers(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {(c.get("email") or "").strip().lower(): c for c in fetch_all_customers(src_client) if c.get("email")}
     dest_by = {(c.get("email") or "").strip().lower(): c for c in fetch_all_customers(dest_client) if c.get("email")}
@@ -349,10 +293,6 @@ def compare_customers(src_client: ShopifyClient, dest_client: ShopifyClient) -> 
     }
 
 
-# ---------------------------------------------------------------------------
-# Redirects
-# ---------------------------------------------------------------------------
-
 def compare_redirects(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {r["path"]: r for r in fetch_all_redirects(src_client)}
     dest_by = {r["path"]: r for r in fetch_all_redirects(dest_client)}
@@ -377,10 +317,6 @@ def compare_redirects(src_client: ShopifyClient, dest_client: ShopifyClient) -> 
         "mismatches": mismatches,
     }
 
-
-# ---------------------------------------------------------------------------
-# Discounts
-# ---------------------------------------------------------------------------
 
 def discount_key(node: Dict[str, Any]) -> Optional[str]:
     d = node.get("discount") or {}
@@ -432,10 +368,6 @@ def compare_discounts(src_client: ShopifyClient, dest_client: ShopifyClient) -> 
     }
 
 
-# ---------------------------------------------------------------------------
-# Orders
-# ---------------------------------------------------------------------------
-
 def compare_orders(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {o["name"]: o for o in fetch_all_orders(src_client)}
     dest_by = {o["name"]: o for o in fetch_all_orders(dest_client)}
@@ -466,10 +398,6 @@ def compare_orders(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dic
     }
 
 
-# ---------------------------------------------------------------------------
-# Shop policies
-# ---------------------------------------------------------------------------
-
 def compare_policies(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     src_by = {p["type"]: p for p in fetch_shop_policies(src_client) if p.get("body")}
     dest_by = {p["type"]: p for p in fetch_shop_policies(dest_client)}
@@ -494,13 +422,9 @@ def compare_policies(src_client: ShopifyClient, dest_client: ShopifyClient) -> D
     }
 
 
-# ---------------------------------------------------------------------------
-# Locations (best-effort -- known to be scope-blocked as of this writing)
-# ---------------------------------------------------------------------------
-
 def compare_locations(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
     try:
-        from Transfer.transfer_locations import fetch_all_locations
+        from transfer.transfer_locations import fetch_all_locations
         src_by = {l.get("name"): l for l in fetch_all_locations(src_client)}
         dest_by = {l.get("name"): l for l in fetch_all_locations(dest_client)}
     except Exception as e:
@@ -523,6 +447,365 @@ def compare_locations(src_client: ShopifyClient, dest_client: ShopifyClient) -> 
     }
 
 
+def compare_draft_orders(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_by = {o["name"]: o for o in fetch_all_draft_orders(src_client)}
+        dest_by = {o["name"]: o for o in fetch_all_draft_orders(dest_client)}
+    except Exception as e:
+        return {
+            "resource": "draft_orders",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_draft_orders scope not granted on one or both stores (or another fetch error).",
+        }
+
+    missing = sorted(set(src_by) - set(dest_by))
+    extra = sorted(set(dest_by) - set(src_by))
+
+    mismatches = []
+    for name, s in src_by.items():
+        d = dest_by.get(name)
+        if not d:
+            continue
+        diff: Dict[str, Any] = {}
+        if diff_value(s.get("email"), d.get("email")):
+            diff["email"] = (s.get("email"), d.get("email"))
+        if diff_value(s.get("status"), d.get("status")):
+            diff["status"] = (s.get("status"), d.get("status"))
+        if diff:
+            mismatches.append({"name": name, "field_mismatches": diff})
+
+    return {
+        "resource": "draft_orders",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+        "note": (
+            "transfer_draft_orders.py deliberately excludes COMPLETED (and CANCELLED) source draft "
+            "orders from migration -- a COMPLETED draft order already became a real Order on Src, "
+            "already verified separately by the 'orders' resource, so it is never re-created as a "
+            "draft on dest. Draft orders appearing in missing_on_dest here are therefore expected for "
+            "every COMPLETED/CANCELLED source draft order, not a migration bug."
+        ),
+    }
+
+
+def compare_gift_cards(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_raw = fetch_all_gift_cards(src_client)
+        dest_raw = fetch_all_gift_cards(dest_client)
+    except Exception as e:
+        return {
+            "resource": "gift_cards",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_gift_cards scope not granted on one or both stores.",
+        }
+
+    src_eligible = []
+    for gc in src_raw:
+        if not gc.get("enabled"):
+            continue
+        balance = gc.get("balance") or {}
+        amount = balance.get("amount")
+        try:
+            if amount is None or float(amount) <= 0:
+                continue
+        except (TypeError, ValueError):
+            continue
+        src_eligible.append(gc)
+
+    def sum_by_currency(cards: List[Dict[str, Any]]) -> Dict[str, str]:
+        totals: Dict[str, float] = {}
+        for c in cards:
+            balance = c.get("balance") or {}
+            amount = balance.get("amount")
+            currency = balance.get("currencyCode") or "UNKNOWN"
+            try:
+                totals[currency] = totals.get(currency, 0.0) + float(amount)
+            except (TypeError, ValueError):
+                continue
+        return {cur: f"{amt:.2f}" for cur, amt in totals.items()}
+
+    src_totals = sum_by_currency(src_eligible)
+    dest_totals = sum_by_currency(dest_raw)
+
+    marker_path = Path("Results") / "gift_cards_migrated.json"
+    marker_count: Optional[int] = None
+    if marker_path.exists():
+        try:
+            with open(marker_path, "r", encoding="utf-8") as f:
+                marker_records = json.load(f)
+            marker_count = len(marker_records) if isinstance(marker_records, list) else None
+        except Exception:
+            marker_count = None
+
+    return {
+        "resource": "gift_cards",
+        "source_count": len(src_eligible),
+        "dest_count": len(dest_raw),
+        "source_total_balance": src_totals,
+        "dest_total_balance": dest_totals,
+        "missing_on_dest": [],
+        "extra_on_dest": [],
+        "mismatches": [],
+        "marker_file_entries": marker_count,
+        "note": (
+            "Gift cards can NEVER be matched 1:1 by identity across stores: Shopify's Admin API never "
+            "exposes a gift card's actual redeemable code (only a masked one), and a migrated gift card "
+            "is always created with a brand-new, different code on dest. So this is a balance-total "
+            "sanity check only, not a per-record diff. source_count/source_total_balance reflect only "
+            "ENABLED, non-zero-balance gift cards on Src (the same eligibility filter "
+            "transfer_gift_cards.py uses, grouped by currency); dest_count/dest_total_balance reflect ALL "
+            "gift cards on dest, since a fresh destination store may already have unrelated ones. "
+            "marker_file_entries is the count of entries in Results/gift_cards_migrated.json if that "
+            "marker file exists -- it's the authoritative record of what this pipeline has actually "
+            "created on dest."
+        ),
+    }
+
+
+def compare_b2b(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_by = {c["name"]: c for c in fetch_all_companies(src_client) if c.get("name")}
+        dest_by = {c["name"]: c for c in fetch_all_companies(dest_client) if c.get("name")}
+    except Exception as e:
+        return {
+            "resource": "b2b",
+            "blocked": True,
+            "reason": str(e),
+            "note": (
+                "read_companies scope not granted on one or both stores, or the B2B schema doesn't "
+                "match this store's API version -- see transfer_b2b.py's schema-stability warning."
+            ),
+        }
+
+    missing = sorted(set(src_by) - set(dest_by))
+    extra = sorted(set(dest_by) - set(src_by))
+
+    mismatches = []
+    for name, s in src_by.items():
+        d = dest_by.get(name)
+        if not d:
+            continue
+        diff: Dict[str, Any] = {}
+        if diff_value(s.get("note"), d.get("note")):
+            diff["note"] = (s.get("note"), d.get("note"))
+        if diff_value(s.get("externalId"), d.get("externalId")):
+            diff["externalId"] = (s.get("externalId"), d.get("externalId"))
+
+        s_locations = (s.get("locations") or {}).get("edges") or []
+        d_locations = (d.get("locations") or {}).get("edges") or []
+        if len(s_locations) != len(d_locations):
+            diff["location_count"] = (len(s_locations), len(d_locations))
+
+        s_contacts = (s.get("contacts") or {}).get("edges") or []
+        d_contacts = (d.get("contacts") or {}).get("edges") or []
+        if len(s_contacts) != len(d_contacts):
+            diff["contact_count"] = (len(s_contacts), len(d_contacts))
+
+        if diff:
+            mismatches.append({"name": name, "field_mismatches": diff})
+
+    return {
+        "resource": "b2b",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+    }
+
+
+def compare_markets(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_by = {m["name"]: m for m in fetch_all_markets(src_client) if m.get("name")}
+        dest_by = {m["name"]: m for m in fetch_all_markets(dest_client) if m.get("name")}
+    except Exception as e:
+        return {
+            "resource": "markets",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_markets scope not granted on one or both stores.",
+        }
+
+    missing = sorted(set(src_by) - set(dest_by))
+    extra = sorted(set(dest_by) - set(src_by))
+
+    def region_codes(market: Dict[str, Any]) -> set:
+        codes = set()
+        for edge in (market.get("regions") or {}).get("edges", []):
+            node = edge.get("node") or {}
+            code = node.get("code")
+            if code:
+                codes.add(code)
+        return codes
+
+    mismatches = []
+    for name, s in src_by.items():
+        d = dest_by.get(name)
+        if not d:
+            continue
+        diff: Dict[str, Any] = {}
+        if diff_value(s.get("enabled"), d.get("enabled")):
+            diff["enabled"] = (s.get("enabled"), d.get("enabled"))
+
+        s_regions = region_codes(s)
+        d_regions = region_codes(d)
+        if s_regions != d_regions:
+            diff["region_country_codes"] = (sorted(s_regions), sorted(d_regions))
+
+        if diff:
+            mismatches.append({"name": name, "field_mismatches": diff})
+
+    return {
+        "resource": "markets",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+    }
+
+
+def compare_files(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_by = {f["filename_key"]: f for f in export_files(src_client)}
+        dest_by = {f["filename_key"]: f for f in export_files(dest_client)}
+    except Exception as e:
+        return {
+            "resource": "files",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_files scope not granted on one or both stores.",
+        }
+
+    missing = sorted(set(src_by) - set(dest_by))
+    extra = sorted(set(dest_by) - set(src_by))
+
+    mismatches = []
+    for key, s in src_by.items():
+        d = dest_by.get(key)
+        if not d:
+            continue
+        diff: Dict[str, Any] = {}
+        if diff_value(s.get("content_type"), d.get("content_type")):
+            diff["content_type"] = (s.get("content_type"), d.get("content_type"))
+        if diff_value(s.get("alt"), d.get("alt")):
+            diff["alt"] = (s.get("alt"), d.get("alt"))
+        if diff:
+            mismatches.append({"filename_key": key, "field_mismatches": diff})
+
+    return {
+        "resource": "files",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+        "note": (
+            "Matched by filename_key, the same de-dup heuristic transfer_files.py itself uses: the "
+            "last URL path segment (lowercased) with a trailing hash/UUID-like suffix stripped -- see "
+            "transfer_files.py's filename_key_from_url/filename_key_from_path. This is a heuristic, not "
+            "a true identity check: two genuinely different files that happen to share a filename would "
+            "appear matched here rather than as missing/extra."
+        ),
+    }
+
+
+def compare_selling_plans(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_groups = export_selling_plan_groups(src_client)
+        dest_groups = export_selling_plan_groups(dest_client)
+    except Exception as e:
+        return {
+            "resource": "selling_plans",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_products/read_selling_plans scope not granted on one or both stores.",
+        }
+
+    def group_key(g: Dict[str, Any]):
+        return ((g.get("name") or "").strip().lower(), (g.get("merchant_code") or "").strip().lower())
+
+    src_by = {group_key(g): g for g in src_groups}
+    dest_by = {group_key(g): g for g in dest_groups}
+
+    missing = sorted(f"{n}|{m}" for n, m in (set(src_by) - set(dest_by)))
+    extra = sorted(f"{n}|{m}" for n, m in (set(dest_by) - set(src_by)))
+
+    mismatches = []
+    for key, s in src_by.items():
+        d = dest_by.get(key)
+        if not d:
+            continue
+        diff: Dict[str, Any] = {}
+        if diff_value(s.get("description"), d.get("description")):
+            diff["description"] = (s.get("description"), d.get("description"))
+        s_plans, d_plans = s.get("selling_plans") or [], d.get("selling_plans") or []
+        if len(s_plans) != len(d_plans):
+            diff["selling_plan_count"] = (len(s_plans), len(d_plans))
+        s_handles, d_handles = set(s.get("product_handles") or []), set(d.get("product_handles") or [])
+        if s_handles != d_handles:
+            diff["product_handles"] = (sorted(s_handles), sorted(d_handles))
+        if diff:
+            mismatches.append({"name": key[0], "field_mismatches": diff})
+
+    return {
+        "resource": "selling_plans",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+        "note": (
+            "Matched by (name, merchantCode) -- the same key transfer_selling_plans.py's own "
+            "import_selling_plan_groups uses to dedupe against the destination. This resource covers "
+            "selling plan GROUP TEMPLATES only, not individual customers' live subscription contracts "
+            "(those aren't portable via the Admin API at all -- see transfer_selling_plans.py's module "
+            "docstring)."
+        ),
+    }
+
+
+def compare_customer_segments(src_client: ShopifyClient, dest_client: ShopifyClient) -> Dict[str, Any]:
+    try:
+        src_by = {(s.get("name") or "").strip().lower(): s for s in export_segments(src_client)}
+        dest_by = {(s.get("name") or "").strip().lower(): s for s in export_segments(dest_client)}
+    except Exception as e:
+        return {
+            "resource": "customer_segments",
+            "blocked": True,
+            "reason": str(e),
+            "note": "read_customers scope not granted on one or both stores.",
+        }
+
+    missing = sorted(set(src_by) - set(dest_by))
+    extra = sorted(set(dest_by) - set(src_by))
+
+    mismatches = []
+    for key, s in src_by.items():
+        d = dest_by.get(key)
+        if not d:
+            continue
+        if diff_value(s.get("query"), d.get("query")):
+            mismatches.append({
+                "name": s.get("name"),
+                "field_mismatches": {"query": (s.get("query"), d.get("query"))},
+            })
+
+    return {
+        "resource": "customer_segments",
+        "source_count": len(src_by),
+        "dest_count": len(dest_by),
+        "missing_on_dest": missing,
+        "extra_on_dest": extra,
+        "mismatches": mismatches,
+    }
+
+
 COMPARE_FUNCS = {
     "collections": compare_collections,
     "pages": compare_pages,
@@ -534,6 +817,13 @@ COMPARE_FUNCS = {
     "orders": compare_orders,
     "policies": compare_policies,
     "locations": compare_locations,
+    "draft_orders": compare_draft_orders,
+    "gift_cards": compare_gift_cards,
+    "b2b": compare_b2b,
+    "markets": compare_markets,
+    "files": compare_files,
+    "selling_plans": compare_selling_plans,
+    "customer_segments": compare_customer_segments,
 }
 
 
@@ -544,7 +834,7 @@ def build_detail_rows(resource: str, result: Dict[str, Any]) -> List[List[str]]:
     for h in result.get("extra_on_dest", []):
         rows.append([resource, "extra_on_dest", str(h), "", ""])
     for m in result.get("mismatches", []):
-        key = m.get("handle") or m.get("email") or m.get("path") or m.get("key") or m.get("name") or m.get("type") or ""
+        key = m.get("handle") or m.get("email") or m.get("path") or m.get("key") or m.get("name") or m.get("type") or m.get("filename_key") or ""
         for field, (s, d) in m.get("field_mismatches", {}).items():
             rows.append([resource, f"mismatch:{field}", str(key), str(s), str(d)])
 
@@ -634,10 +924,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     src_client = make_client(src_shop, src_token)
     dest_client = make_client(dest_shop, dest_token)
