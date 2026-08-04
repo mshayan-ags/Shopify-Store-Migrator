@@ -1,23 +1,3 @@
-"""Audit-only report of shop-level tax settings -- NOT a transfer script.
-
-This is mostly NOT automatable. `Shop.taxesIncluded` and `Shop.taxShipping`
-are the only general tax fields the Admin API exposes, and both are
-read-only -- there is no documented mutation that writes them. Region-by-
-region tax rates/registrations (Shopify Tax, or a third-party tax app) live
-outside the Admin API entirely for a regular merchant; the only tax
-mutations that exist (`taxAppConfigure`, `companyLocationTaxSettingsUpdate`)
-configure a tax PARTNER app's own behavior or B2B company-location
-overrides, not general shop tax rates, so they don't apply here.
-
-What this script actually does: reads the two booleans that ARE exposed,
-reports them side by side for both stores, and reminds you to match the
-"Charge tax on shipping" / "All prices include tax" toggles by hand under
-Settings > Taxes and duties on dest -- those toggles, plus any
-country/region tax registrations, must be set manually.
-
-Usage:
-    python audit_tax_settings.py
-"""
 import json
 import logging
 import os
@@ -27,13 +7,14 @@ from typing import Any, Dict
 
 from dotenv import load_dotenv
 
-from Transfer.transfer_product import make_client
+from transfer.transfer_product import make_client
 from utils.concurrency_utils import retry_with_backoff
+from utils.config import require_env
 
 load_dotenv()
 
 logger = logging.getLogger("audit_tax_settings")
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)-8s %(name)s: %(message)s", datefmt="%Y-%m-%d %H:%M:%S")
 
 QUERY = """
 query {
@@ -66,10 +47,10 @@ def main() -> None:
     dest_shop = os.getenv("DEST_SHOPIFY_SHOP")
     dest_token = os.getenv("DEST_SHOPIFY_ACCESS_TOKEN")
 
-    if not all([src_shop, src_token, dest_shop, dest_token]):
-        raise RuntimeError(
-            "Missing .env values: SRC_SHOPIFY_SHOP, SRC_SHOPIFY_ACCESS_TOKEN, DEST_SHOPIFY_SHOP, DEST_SHOPIFY_ACCESS_TOKEN"
-        )
+    require_env(
+        SRC_SHOPIFY_SHOP=src_shop, SRC_SHOPIFY_ACCESS_TOKEN=src_token,
+        DEST_SHOPIFY_SHOP=dest_shop, DEST_SHOPIFY_ACCESS_TOKEN=dest_token,
+    )
 
     out_dir = Path("Results")
     out_dir.mkdir(parents=True, exist_ok=True)
