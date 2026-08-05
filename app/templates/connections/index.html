@@ -1,0 +1,221 @@
+{% extends "base.html" %}
+{% block title %}Connections{% endblock %}
+{% block content %}
+<div class="page-header">
+  <h1>Connections</h1>
+  <button class="btn btn-primary" onclick="smwShowForm()">Add connection</button>
+</div>
+<p class="muted">Stored only in this browser's local storage -- never sent to or saved on the server, except transiently when you start a job or click "Test".</p>
+
+<div class="card" id="form-card" style="display:none">
+  <h2 id="form-title">Add connection</h2>
+  <input type="hidden" id="f-id">
+  <label>Name</label>
+  <input type="text" id="f-name">
+
+  <label>Kind</label>
+  <select id="f-kind" onchange="smwShowKindFields()">
+    {% for k in kinds %}
+    <option value="{{ k }}">{{ k }}</option>
+    {% endfor %}
+  </select>
+
+  <div id="fields-shopify" class="kind-fields">
+    <label>Shop name (e.g. my-store, with or without .myshopify.com)</label>
+    <input type="text" id="f-shop_domain">
+    <label>Admin API access token</label>
+    <input type="password" id="f-access_token">
+    <label>API key / Client ID (optional -- only needed if you use client-credentials token refresh)</label>
+    <input type="text" id="f-shopify_client_id">
+    <label>API secret key / Client Secret (optional)</label>
+    <input type="password" id="f-shopify_client_secret">
+  </div>
+  <div id="fields-wix" class="kind-fields">
+    <label>API key</label>
+    <input type="password" id="f-api_key">
+    <label>Site ID</label>
+    <input type="text" id="f-site_id">
+  </div>
+  <div id="fields-bigcommerce" class="kind-fields">
+    <label>Store hash</label>
+    <input type="text" id="f-store_hash">
+    <label>Access token</label>
+    <input type="password" id="f-bc_access_token">
+    <label>Client ID (optional)</label>
+    <input type="text" id="f-client_id">
+  </div>
+  <div id="fields-postgresql" class="kind-fields">
+    <label>Database URL (optional, overrides fields below)</label>
+    <input type="text" id="f-database_url" placeholder="postgresql://user:pass@host:5432/db">
+    <div class="row">
+      <div><label>Host</label><input type="text" id="f-pg_host"></div>
+      <div><label>Port</label><input type="text" id="f-pg_port" value="5432"></div>
+    </div>
+    <label>Database</label>
+    <input type="text" id="f-pg_database">
+    <div class="row">
+      <div><label>User</label><input type="text" id="f-pg_user"></div>
+      <div><label>Password</label><input type="password" id="f-pg_password"></div>
+    </div>
+    <label>Mapping YAML path (on the server/container filesystem)</label>
+    <input type="text" id="f-pg_mapping_path" placeholder="sources/postgresql/mapping.example.yaml">
+  </div>
+  <div id="fields-mongodb" class="kind-fields">
+    <label>Connection URI</label>
+    <input type="text" id="f-mongo_uri" placeholder="mongodb://user:pass@host:27017">
+    <label>Database</label>
+    <input type="text" id="f-mongo_database">
+    <label>Mapping YAML path (on the server/container filesystem)</label>
+    <input type="text" id="f-mongo_mapping_path" placeholder="sources/mongodb/mapping.example.yaml">
+  </div>
+
+  <div style="margin-top: 18px">
+    <button class="btn btn-primary" onclick="smwSaveForm()">Save</button>
+    <button class="btn" onclick="smwHideForm()">Cancel</button>
+  </div>
+</div>
+
+<div class="card">
+  <table>
+    <thead><tr><th>Name</th><th>Kind</th><th>Details</th><th></th></tr></thead>
+    <tbody id="connections-tbody"></tbody>
+  </table>
+  <div id="empty-state" class="empty-state" style="display:none">No connections yet -- add one above.</div>
+</div>
+
+<script>
+function smwShowForm(id) {
+  document.getElementById('form-card').style.display = 'block';
+  const conn = id ? smwGetConnection(id) : null;
+  document.getElementById('form-title').textContent = conn ? 'Edit connection' : 'Add connection';
+  document.getElementById('f-id').value = conn ? conn.id : '';
+  document.getElementById('f-name').value = conn ? conn.name : '';
+  document.getElementById('f-kind').value = conn ? conn.kind : 'shopify';
+  const c = (conn && conn.config) || {};
+  document.getElementById('f-shop_domain').value = (conn && conn.shop_domain) || '';
+  document.getElementById('f-access_token').value = (conn && conn.access_token) || '';
+  document.getElementById('f-shopify_client_id').value = c.client_id || '';
+  document.getElementById('f-shopify_client_secret').value = c.client_secret || '';
+  document.getElementById('f-api_key').value = c.api_key || '';
+  document.getElementById('f-site_id').value = c.site_id || '';
+  document.getElementById('f-store_hash').value = c.store_hash || '';
+  document.getElementById('f-bc_access_token').value = c.access_token || '';
+  document.getElementById('f-client_id').value = c.client_id || '';
+  document.getElementById('f-database_url').value = c.database_url || '';
+  document.getElementById('f-pg_host').value = c.host || '';
+  document.getElementById('f-pg_port').value = c.port || '5432';
+  document.getElementById('f-pg_database').value = c.database || '';
+  document.getElementById('f-pg_user').value = c.user || '';
+  document.getElementById('f-pg_password').value = c.password || '';
+  document.getElementById('f-pg_mapping_path').value = c.mapping_path || '';
+  document.getElementById('f-mongo_uri').value = c.uri || '';
+  document.getElementById('f-mongo_database').value = c.database || '';
+  document.getElementById('f-mongo_mapping_path').value = c.mapping_path || '';
+  smwShowKindFields();
+}
+
+function smwHideForm() {
+  document.getElementById('form-card').style.display = 'none';
+}
+
+function smwShowKindFields() {
+  const kind = document.getElementById('f-kind').value;
+  document.querySelectorAll('.kind-fields').forEach(function (el) { el.style.display = 'none'; });
+  const target = document.getElementById('fields-' + kind);
+  if (target) target.style.display = 'block';
+}
+
+function smwSaveForm() {
+  const kind = document.getElementById('f-kind').value;
+  const name = document.getElementById('f-name').value.trim();
+  if (!name) { alert('Name is required'); return; }
+
+  const conn = {
+    id: document.getElementById('f-id').value || smwNewId(),
+    name: name,
+    kind: kind,
+    shop_domain: null,
+    access_token: null,
+    config: {},
+  };
+
+  if (kind === 'shopify') {
+    conn.shop_domain = document.getElementById('f-shop_domain').value.trim();
+    conn.access_token = document.getElementById('f-access_token').value.trim();
+    conn.config = {
+      client_id: document.getElementById('f-shopify_client_id').value.trim(),
+      client_secret: document.getElementById('f-shopify_client_secret').value.trim(),
+    };
+  } else if (kind === 'wix') {
+    conn.config = { api_key: document.getElementById('f-api_key').value.trim(), site_id: document.getElementById('f-site_id').value.trim() };
+  } else if (kind === 'bigcommerce') {
+    conn.config = {
+      store_hash: document.getElementById('f-store_hash').value.trim(),
+      access_token: document.getElementById('f-bc_access_token').value.trim(),
+      client_id: document.getElementById('f-client_id').value.trim(),
+    };
+  } else if (kind === 'postgresql') {
+    conn.config = {
+      database_url: document.getElementById('f-database_url').value.trim(),
+      host: document.getElementById('f-pg_host').value.trim(),
+      port: document.getElementById('f-pg_port').value.trim(),
+      database: document.getElementById('f-pg_database').value.trim(),
+      user: document.getElementById('f-pg_user').value.trim(),
+      password: document.getElementById('f-pg_password').value.trim(),
+      mapping_path: document.getElementById('f-pg_mapping_path').value.trim(),
+    };
+  } else if (kind === 'mongodb') {
+    conn.config = {
+      uri: document.getElementById('f-mongo_uri').value.trim(),
+      database: document.getElementById('f-mongo_database').value.trim(),
+      mapping_path: document.getElementById('f-mongo_mapping_path').value.trim(),
+    };
+  }
+
+  smwUpsertConnection(conn);
+  smwHideForm();
+  smwRenderTable();
+}
+
+function smwDeleteAndRender(id) {
+  if (!confirm('Delete this connection?')) return;
+  smwDeleteConnection(id);
+  smwRenderTable();
+}
+
+function smwTestConnection(id) {
+  const conn = smwGetConnection(id);
+  fetch('/connections/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(conn),
+  })
+    .then(function (r) { return r.json(); })
+    .then(function (data) { alert(data.message); })
+    .catch(function (e) { alert('Test failed: ' + e); });
+}
+
+function smwRenderTable() {
+  const tbody = document.getElementById('connections-tbody');
+  const connections = smwGetConnections();
+  tbody.innerHTML = '';
+  document.getElementById('empty-state').style.display = connections.length ? 'none' : 'block';
+  connections.forEach(function (c) {
+    const tr = document.createElement('tr');
+    const details = c.kind === 'shopify' ? (c.shop_domain || '') : Object.keys(c.config || {}).filter(function (k) { return c.config[k]; }).join(', ');
+    tr.innerHTML =
+      '<td>' + c.name + '</td>' +
+      '<td>' + c.kind + '</td>' +
+      '<td class="muted">' + details + '</td>' +
+      '<td>' +
+      '<button class="btn btn-sm" onclick="smwShowForm(\'' + c.id + '\')">Edit</button> ' +
+      '<button class="btn btn-sm" onclick="smwTestConnection(\'' + c.id + '\')">Test</button> ' +
+      '<button class="btn btn-sm btn-danger" onclick="smwDeleteAndRender(\'' + c.id + '\')">Delete</button>' +
+      '</td>';
+    tbody.appendChild(tr);
+  });
+}
+
+smwRenderTable();
+</script>
+{% endblock %}

@@ -1,0 +1,9 @@
+requests
+python-dotenv
+xlsxwriter
+openpyxl
+pyyaml
+psycopg2-binary
+pymongo
+flask
+gunicorn

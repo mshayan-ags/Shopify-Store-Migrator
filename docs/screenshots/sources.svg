@@ -1,0 +1,34 @@
+<svg viewBox="0 0 1280 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="560" fill="#f6f6f7"/>
+
+  <rect width="220" height="560" fill="#14151a"/>
+  <circle cx="30" cy="34" r="5" fill="#16a37a"/>
+  <text x="44" y="39" fill="#ffffff" font-size="15" font-weight="700">Store Migrator</text>
+  <g font-size="14" fill="#cfd2d8">
+    <text x="44" y="94">Dashboard</text>
+    <text x="44" y="136">Connections</text>
+    <text x="44" y="178">Jobs</text>
+    <text x="44" y="220">Audit</text>
+    <rect x="12" y="240" width="196" height="34" rx="8" fill="#2a2c33"/>
+    <text x="44" y="262" fill="#ffffff" font-weight="600">Sources</text>
+  </g>
+
+  <g transform="translate(252, 40)">
+    <text font-size="22" font-weight="650" fill="#1a1d21">Non-Shopify sources</text>
+    <text x="0" y="30" font-size="13" fill="#6b7280">Export from Wix, BigCommerce, PostgreSQL, or MongoDB into the same canonical JSON the Shopify import scripts consume.</text>
+
+    <rect x="0" y="52" width="700" height="230" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="82" font-size="12.5" font-weight="600" fill="#6b7280">CONNECTION</text>
+    <rect x="20" y="90" width="640" height="36" rx="8" fill="#ffffff" stroke="#16a37a" stroke-width="2"/>
+    <text x="32" y="113" font-size="14" fill="#1a1d21">Legacy Wix Site (wix)</text>
+    <text x="606" y="113" font-size="12" fill="#6b7280">&#9660;</text>
+
+    <text x="20" y="150" font-size="12.5" font-weight="600" fill="#6b7280">RESOURCE</text>
+    <rect x="20" y="158" width="640" height="36" rx="8" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="32" y="181" font-size="14" fill="#1a1d21">products</text>
+    <text x="606" y="181" font-size="12" fill="#6b7280">&#9660;</text>
+
+    <rect x="20" y="212" width="110" height="34" rx="8" fill="#16a37a"/>
+    <text x="46" y="234" font-size="13.5" font-weight="600" fill="#ffffff">Run export</text>
+  </g>
+</svg>

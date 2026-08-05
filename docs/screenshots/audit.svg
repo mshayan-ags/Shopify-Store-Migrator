@@ -1,0 +1,42 @@
+<svg viewBox="0 0 1280 560" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="560" fill="#f6f6f7"/>
+
+  <rect width="220" height="560" fill="#14151a"/>
+  <circle cx="30" cy="34" r="5" fill="#16a37a"/>
+  <text x="44" y="39" fill="#ffffff" font-size="15" font-weight="700">Store Migrator</text>
+  <g font-size="14" fill="#cfd2d8">
+    <text x="44" y="94">Dashboard</text>
+    <text x="44" y="136">Connections</text>
+    <text x="44" y="178">Jobs</text>
+    <rect x="12" y="198" width="196" height="34" rx="8" fill="#2a2c33"/>
+    <text x="44" y="220" fill="#ffffff" font-weight="600">Audit</text>
+    <text x="44" y="262">Sources</text>
+  </g>
+
+  <g transform="translate(252, 40)">
+    <text font-size="22" font-weight="650" fill="#1a1d21">Audit &amp; verification</text>
+    <text x="0" y="30" font-size="13" fill="#6b7280">These are read-only -- they write nothing to either store, only a report under Results/.</text>
+
+    <rect x="0" y="52" width="700" height="330" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="82" font-size="12.5" font-weight="600" fill="#6b7280">SOURCE STORE</text>
+    <rect x="20" y="90" width="310" height="36" rx="8" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="32" y="113" font-size="14" fill="#1a1d21">Old Store (Source)</text>
+    <text x="350" y="82" font-size="12.5" font-weight="600" fill="#6b7280">DESTINATION STORE</text>
+    <rect x="350" y="90" width="310" height="36" rx="8" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="362" y="113" font-size="14" fill="#1a1d21">New Store (Destination)</text>
+
+    <text x="20" y="150" font-size="12.5" font-weight="600" fill="#6b7280">REPORT</text>
+    <rect x="20" y="158" width="640" height="36" rx="8" fill="#ffffff" stroke="#16a37a" stroke-width="2"/>
+    <text x="32" y="181" font-size="14" fill="#1a1d21">Verify store migration</text>
+    <text x="606" y="181" font-size="12" fill="#6b7280">&#9660;</text>
+
+    <rect x="20" y="210" width="640" height="120" rx="8" fill="#fbfbfc" stroke="#e3e5e8"/>
+    <text x="34" y="234" font-size="13.5" font-weight="600" fill="#6b7280">&#9660; Options</text>
+    <text x="34" y="260" font-size="12.5" fill="#6b7280">Resource (leave as "all" to check everything)</text>
+    <rect x="34" y="268" width="600" height="30" rx="6" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="44" y="288" font-size="13" fill="#1a1d21">all</text>
+
+    <rect x="20" y="348" width="120" height="34" rx="8" fill="#16a37a"/>
+    <text x="42" y="370" font-size="13.5" font-weight="600" fill="#ffffff">Run report</text>
+  </g>
+</svg>

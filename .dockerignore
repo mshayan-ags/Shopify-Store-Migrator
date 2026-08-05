@@ -1,0 +1,8 @@
+.git
+.claude
+__pycache__
+*.pyc
+data
+Results
+.env
+*.md

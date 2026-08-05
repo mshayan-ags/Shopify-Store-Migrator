@@ -1,0 +1,59 @@
+<svg viewBox="0 0 1280 640" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="640" fill="#f6f6f7"/>
+
+  <rect width="220" height="640" fill="#14151a"/>
+  <circle cx="30" cy="34" r="5" fill="#16a37a"/>
+  <text x="44" y="39" fill="#ffffff" font-size="15" font-weight="700">Store Migrator</text>
+  <g font-size="14" fill="#cfd2d8">
+    <text x="44" y="94">Dashboard</text>
+    <rect x="12" y="114" width="196" height="34" rx="8" fill="#2a2c33"/>
+    <text x="44" y="136" fill="#ffffff" font-weight="600">Connections</text>
+    <text x="44" y="178">Jobs</text>
+    <text x="44" y="220">Audit</text>
+    <text x="44" y="262">Sources</text>
+  </g>
+
+  <g transform="translate(252, 40)">
+    <text font-size="22" font-weight="650" fill="#1a1d21">Connections</text>
+    <rect x="690" y="-8" width="140" height="34" rx="8" fill="#16a37a"/>
+    <text x="712" y="14" font-size="13.5" font-weight="600" fill="#ffffff">Add connection</text>
+
+    <text x="0" y="34" font-size="13" fill="#6b7280">Stored only in this browser's local storage -- never sent to or saved on the server, except transiently when you start a job or click "Test".</text>
+
+    <rect x="0" y="56" width="830" height="240" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <g font-size="12" font-weight="600" fill="#6b7280">
+      <text x="20" y="86">NAME</text>
+      <text x="220" y="86">KIND</text>
+      <text x="340" y="86">DETAILS</text>
+    </g>
+    <line x1="20" y1="96" x2="810" y2="96" stroke="#e3e5e8"/>
+
+    <g font-size="13.5" fill="#1a1d21">
+      <text x="20" y="124">Old Store (Source)</text>
+      <text x="220" y="124">shopify</text>
+      <text x="340" y="124" fill="#6b7280">old-store.myshopify.com</text>
+      <text x="640" y="124" fill="#1a1d21">Edit</text>
+      <text x="676" y="124" fill="#1a1d21">Test</text>
+      <text x="714" y="124" fill="#e0402a">Delete</text>
+      <line x1="20" y1="138" x2="810" y2="138" stroke="#e3e5e8"/>
+
+      <text x="20" y="166">New Store (Destination)</text>
+      <text x="220" y="166">shopify</text>
+      <text x="340" y="166" fill="#6b7280">new-store.myshopify.com</text>
+      <text x="640" y="166" fill="#1a1d21">Edit</text>
+      <text x="676" y="166" fill="#1a1d21">Test</text>
+      <text x="714" y="166" fill="#e0402a">Delete</text>
+      <line x1="20" y1="180" x2="810" y2="180" stroke="#e3e5e8"/>
+
+      <text x="20" y="208">Legacy Wix Site</text>
+      <text x="220" y="208">wix</text>
+      <text x="340" y="208" fill="#6b7280">api_key, site_id</text>
+      <text x="640" y="208" fill="#1a1d21">Edit</text>
+      <text x="676" y="208" fill="#1a1d21">Test</text>
+      <text x="714" y="208" fill="#e0402a">Delete</text>
+    </g>
+
+    <!-- Add connection form panel -->
+    <rect x="870" y="56" width="0" height="0"/>
+  </g>
+</svg>

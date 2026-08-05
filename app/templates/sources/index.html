@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% block title %}Sources{% endblock %}
+{% block content %}
+<h1>Non-Shopify sources</h1>
+<p class="muted">Export from Wix, BigCommerce, PostgreSQL, or MongoDB into canonical JSON, then use it as --import-from input on a Transfer script.</p>
+
+<div class="card" id="no-connections-notice" style="display:none">
+  <p class="muted">No Wix/BigCommerce/PostgreSQL/MongoDB connections yet.</p>
+  <a href="{{ url_for('connections.index') }}" class="btn btn-primary">Add a connection</a>
+</div>
+
+<div class="card" id="run-card">
+  <form method="post" action="{{ url_for('sources.run') }}" onsubmit="return smwPrepareSourceForm(this)">
+    <input type="hidden" name="connection_json" id="connection-json">
+    <label>Connection</label>
+    <select id="conn-select" onchange="updateResources()"></select>
+
+    <label>Resource</label>
+    <select name="resource" id="resource-select"></select>
+
+    <div style="margin-top: 16px">
+      <button type="submit" class="btn btn-primary">Run export</button>
+    </div>
+  </form>
+</div>
+
+<script>
+var resourceChoices = {{ resource_choices|tojson }};
+var sourceKinds = ['wix', 'bigcommerce', 'postgresql', 'mongodb'];
+
+function updateResources() {
+  var select = document.getElementById('conn-select');
+  var conn = smwGetConnection(select.value);
+  var kind = conn ? conn.kind : null;
+  var resourceSelect = document.getElementById('resource-select');
+  resourceSelect.innerHTML = '';
+  (resourceChoices[kind] || []).forEach(function (r) {
+    var o = document.createElement('option');
+    o.value = r;
+    o.textContent = r;
+    resourceSelect.appendChild(o);
+  });
+}
+
+function smwPrepareSourceForm(form) {
+  var select = document.getElementById('conn-select');
+  smwFillHiddenJson(select, document.getElementById('connection-json'));
+  if (!select.value) {
+    alert('Add a Wix/BigCommerce/PostgreSQL/MongoDB connection first.');
+    return false;
+  }
+  return true;
+}
+
+(function () {
+  var connections = smwConnectionsOfKind(sourceKinds);
+  document.getElementById('no-connections-notice').style.display = connections.length ? 'none' : 'block';
+  document.getElementById('run-card').style.display = connections.length ? 'block' : 'none';
+  smwPopulateSelect(document.getElementById('conn-select'), sourceKinds);
+  updateResources();
+})();
+</script>
+{% endblock %}

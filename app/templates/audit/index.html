@@ -1,0 +1,91 @@
+{% extends "base.html" %}
+{% block title %}Audit{% endblock %}
+{% block content %}
+<h1>Audit &amp; verification</h1>
+<p class="muted">These are read-only -- they write nothing to either store, only a report under Results/.</p>
+
+<div class="card" id="no-connections-notice" style="display:none">
+  <p class="muted">You need at least two Shopify connections before running an audit.</p>
+  <a href="{{ url_for('connections.index') }}" class="btn btn-primary">Add a connection</a>
+</div>
+
+<div class="card" id="run-card">
+  <form method="post" action="{{ url_for('audit.run') }}" onsubmit="return smwPrepareRunForm(this)">
+    <input type="hidden" name="source_connection_json" id="source-connection-json">
+    <input type="hidden" name="dest_connection_json" id="dest-connection-json">
+    <div class="row">
+      <div>
+        <label>Source store</label>
+        <select id="source-select"></select>
+      </div>
+      <div>
+        <label>Destination store</label>
+        <select id="dest-select"></select>
+      </div>
+    </div>
+
+    <label>Report</label>
+    <select name="script" id="script-select" onchange="smwToggleAuditOptions()">
+      {% for key, s in scripts.items() %}
+      <option value="{{ key }}">{{ s.label }}</option>
+      {% endfor %}
+    </select>
+
+    <div id="verify-store-options" style="display:none; margin-top: 10px">
+      <label>Resource (leave as "all" to check everything)</label>
+      <select name="resource">
+        <option value="all">all</option>
+        {% for r in verify_store_resources %}
+        <option value="{{ r }}">{{ r }}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div id="verify-products-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <div class="row">
+          <div><label>Limit (first N products)</label><input type="number" name="limit" min="1" placeholder="all"></div>
+          <div><label>Start at (0-indexed)</label><input type="number" name="start_at" min="0" placeholder="0"></div>
+        </div>
+        <label>Workers</label>
+        <input type="number" name="workers" min="1" placeholder="default">
+        <label><input type="checkbox" name="deep_images"> Byte-compare image content too (downloads every image from both stores -- slow)</label>
+      </details>
+    </div>
+
+    <div style="margin-top: 16px">
+      <button type="submit" class="btn btn-primary">Run report</button>
+    </div>
+  </form>
+</div>
+
+<script>
+function smwToggleAuditOptions() {
+  var script = document.getElementById('script-select').value;
+  document.getElementById('verify-store-options').style.display = (script === 'verify_store') ? 'block' : 'none';
+  document.getElementById('verify-products-options').style.display = (script === 'verify_products') ? 'block' : 'none';
+}
+
+function smwPrepareRunForm(form) {
+  var srcSelect = document.getElementById('source-select');
+  var destSelect = document.getElementById('dest-select');
+  smwFillHiddenJson(srcSelect, document.getElementById('source-connection-json'));
+  smwFillHiddenJson(destSelect, document.getElementById('dest-connection-json'));
+  if (!srcSelect.value || !destSelect.value) {
+    alert('Add at least two Shopify connections first.');
+    return false;
+  }
+  return true;
+}
+
+(function () {
+  var shopifyConnections = smwConnectionsOfKind(['shopify']);
+  document.getElementById('no-connections-notice').style.display = shopifyConnections.length < 2 ? 'block' : 'none';
+  document.getElementById('run-card').style.display = shopifyConnections.length < 2 ? 'none' : 'block';
+  smwPopulateSelect(document.getElementById('source-select'), ['shopify']);
+  smwPopulateSelect(document.getElementById('dest-select'), ['shopify']);
+  smwToggleAuditOptions();
+})();
+</script>
+{% endblock %}

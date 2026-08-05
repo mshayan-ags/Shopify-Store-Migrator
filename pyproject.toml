@@ -1,0 +1,19 @@
+[project]
+name = "shopify-store-migrator"
+version = "1.0.0"
+description = "Migrate a Shopify store (or Wix/BigCommerce/PostgreSQL/MongoDB) into Shopify, as CLI scripts or a self-hosted web app"
+requires-python = ">=3.10"
+dependencies = [
+    "requests",
+    "python-dotenv",
+    "xlsxwriter",
+    "openpyxl",
+    "pyyaml",
+    "psycopg2-binary",
+    "pymongo",
+    "flask",
+    "gunicorn",
+]
+
+[tool.setuptools.packages.find]
+include = ["transfer*", "audit*", "sources*", "utils*", "app*"]

@@ -1,0 +1,94 @@
+<svg viewBox="0 0 1280 860" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="860" fill="#f6f6f7"/>
+
+  <!-- Sidebar -->
+  <rect width="220" height="860" fill="#14151a"/>
+  <circle cx="30" cy="34" r="5" fill="#16a37a"/>
+  <text x="44" y="39" fill="#ffffff" font-size="15" font-weight="700">Store Migrator</text>
+
+  <g font-size="14" fill="#cfd2d8">
+    <rect x="12" y="72" width="196" height="34" rx="8" fill="#2a2c33"/>
+    <text x="44" y="94" fill="#ffffff" font-weight="600">Dashboard</text>
+    <text x="44" y="136">Connections</text>
+    <text x="44" y="178">Jobs</text>
+    <text x="44" y="220">Audit</text>
+    <text x="44" y="262">Sources</text>
+  </g>
+  <text x="20" y="830" fill="#6b6e76" font-size="11">Self-hosted &#183; no data leaves this server</text>
+
+  <!-- Content -->
+  <g transform="translate(252, 40)">
+    <text font-size="22" font-weight="650" fill="#1a1d21">Migration dashboard</text>
+
+    <!-- Run a step card -->
+    <rect x="0" y="40" width="820" height="470" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="70" font-size="15" font-weight="650" fill="#1a1d21">Run a step</text>
+    <text x="20" y="92" font-size="12.5" fill="#6b7280">Each step runs its own script directly with that script's own options -- only "all" runs the combined pipeline.</text>
+
+    <text x="20" y="128" font-size="12.5" font-weight="600" fill="#6b7280">SOURCE STORE</text>
+    <rect x="20" y="136" width="380" height="36" rx="8" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="32" y="159" font-size="14" fill="#1a1d21">Old Store (Source)</text>
+
+    <text x="420" y="128" font-size="12.5" font-weight="600" fill="#6b7280">DESTINATION STORE</text>
+    <rect x="420" y="136" width="380" height="36" rx="8" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="432" y="159" font-size="14" fill="#1a1d21">New Store (Destination)</text>
+
+    <text x="20" y="196" font-size="12.5" font-weight="600" fill="#6b7280">STEP</text>
+    <rect x="20" y="204" width="380" height="36" rx="8" fill="#ffffff" stroke="#16a37a" stroke-width="2"/>
+    <text x="32" y="227" font-size="14" fill="#1a1d21">products</text>
+    <text x="386" y="227" font-size="12" fill="#6b7280">&#9660;</text>
+
+    <rect x="20" y="256" width="16" height="16" rx="3" fill="#ffffff" stroke="#c8cbd0"/>
+    <text x="44" y="269" font-size="13.5" fill="#1a1d21">Execute (write to destination store) -- leave unchecked for a dry-run export only</text>
+
+    <rect x="20" y="288" width="780" height="164" rx="8" fill="#fbfbfc" stroke="#e3e5e8"/>
+    <text x="34" y="312" font-size="13.5" font-weight="600" fill="#6b7280">&#9660; Options</text>
+    <text x="34" y="338" font-size="12.5" fill="#6b7280">Single product handle or ID (leave blank to transfer every product)</text>
+    <rect x="34" y="346" width="740" height="30" rx="6" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="44" y="366" font-size="13" fill="#9497a0">all products</text>
+
+    <text x="34" y="398" font-size="12.5" fill="#6b7280">Limit (first N products)</text>
+    <rect x="34" y="406" width="356" height="30" rx="6" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="44" y="426" font-size="13" fill="#9497a0">all</text>
+    <text x="410" y="398" font-size="12.5" fill="#6b7280">Concurrent workers</text>
+    <rect x="410" y="406" width="364" height="30" rx="6" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="420" y="426" font-size="13" fill="#9497a0">default</text>
+
+    <rect x="20" y="470" width="94" height="34" rx="8" fill="#16a37a"/>
+    <text x="46" y="492" font-size="13.5" font-weight="600" fill="#ffffff">Run</text>
+
+    <!-- Recent jobs card -->
+    <rect x="0" y="528" width="820" height="270" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="558" font-size="15" font-weight="650" fill="#1a1d21">Recent jobs</text>
+
+    <g font-size="12" font-weight="600" fill="#6b7280">
+      <text x="20" y="588">#</text>
+      <text x="60" y="588">LABEL</text>
+      <text x="360" y="588">STATUS</text>
+      <text x="500" y="588">STARTED</text>
+    </g>
+    <line x1="20" y1="598" x2="800" y2="598" stroke="#e3e5e8"/>
+
+    <g font-size="13.5" fill="#1a1d21">
+      <text x="20" y="626">24</text>
+      <text x="60" y="626">products (execute)</text>
+      <rect x="360" y="610" width="70" height="20" rx="10" fill="#e6f6f1"/>
+      <text x="371" y="624" font-size="11.5" font-weight="650" fill="#16a37a">SUCCESS</text>
+      <text x="500" y="626" fill="#6b7280">2026-08-03 14:02:11</text>
+
+      <line x1="20" y1="640" x2="800" y2="640" stroke="#e3e5e8"/>
+      <text x="20" y="666">23</text>
+      <text x="60" y="666">collections (dry-run)</text>
+      <rect x="360" y="650" width="70" height="20" rx="10" fill="#e6f6f1"/>
+      <text x="371" y="664" font-size="11.5" font-weight="650" fill="#16a37a">SUCCESS</text>
+      <text x="500" y="666" fill="#6b7280">2026-08-03 13:58:47</text>
+
+      <line x1="20" y1="680" x2="800" y2="680" stroke="#e3e5e8"/>
+      <text x="20" y="706">22</text>
+      <text x="60" y="706">theme (execute)</text>
+      <rect x="360" y="690" width="60" height="20" rx="10" fill="#fdf2df"/>
+      <text x="371" y="704" font-size="11.5" font-weight="650" fill="#b5790a">RUNNING</text>
+      <text x="500" y="706" fill="#6b7280">2026-08-03 13:55:02</text>
+    </g>
+  </g>
+</svg>

@@ -1,0 +1,46 @@
+<svg viewBox="0 0 1280 700" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif">
+  <rect width="1280" height="700" fill="#f6f6f7"/>
+
+  <rect width="220" height="700" fill="#14151a"/>
+  <circle cx="30" cy="34" r="5" fill="#16a37a"/>
+  <text x="44" y="39" fill="#ffffff" font-size="15" font-weight="700">Store Migrator</text>
+  <g font-size="14" fill="#cfd2d8">
+    <text x="44" y="94">Dashboard</text>
+    <text x="44" y="136">Connections</text>
+    <rect x="12" y="156" width="196" height="34" rx="8" fill="#2a2c33"/>
+    <text x="44" y="178" fill="#ffffff" font-weight="600">Jobs</text>
+    <text x="44" y="220">Audit</text>
+    <text x="44" y="262">Sources</text>
+  </g>
+
+  <g transform="translate(252, 40)">
+    <text font-size="22" font-weight="650" fill="#1a1d21">Job #24: products (execute)</text>
+
+    <rect x="0" y="40" width="960" height="88" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="70" font-size="14" fill="#1a1d21">Status:</text>
+    <rect x="72" y="56" width="76" height="20" rx="10" fill="#e6f6f1"/>
+    <text x="84" y="70" font-size="11.5" font-weight="650" fill="#16a37a">SUCCESS</text>
+    <text x="164" y="70" font-size="14" fill="#6b7280">Module: transfer.transfer_product</text>
+    <text x="20" y="96" font-size="12.5" fill="#6b7280">Started 2026-08-03 14:02:11 &#183; Finished 2026-08-03 14:03:48</text>
+
+    <rect x="0" y="148" width="960" height="480" rx="10" fill="#ffffff" stroke="#e3e5e8"/>
+    <text x="20" y="178" font-size="15" font-weight="650" fill="#1a1d21">Log</text>
+
+    <rect x="20" y="196" width="920" height="410" rx="8" fill="#0c0d10"/>
+    <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" fill="#d6d8dc">
+      <text x="34" y="222">2026-08-03 14:02:11 INFO     transfer_product: Transferring 1248 product(s) using 8 worker(s)</text>
+      <text x="34" y="244">2026-08-03 14:02:12 INFO     transfer_product: [product 1/1248] classic-tee</text>
+      <text x="34" y="266">2026-08-03 14:02:12 INFO     transfer_product: [product 2/1248] canvas-tote-bag</text>
+      <text x="34" y="288">2026-08-03 14:02:13 INFO     transfer_product: Created product 'Classic Tee' with ID 8127349501234</text>
+      <text x="34" y="310">2026-08-03 14:02:13 INFO     transfer_product: Created product 'Canvas Tote Bag' with ID 8127349502345</text>
+      <text x="34" y="332">2026-08-03 14:02:14 WARNING  transfer_product: Failed to fetch metafields for image 991234: 429</text>
+      <text x="34" y="354">2026-08-03 14:02:14 WARNING  transfer_product: Transient error on attempt 1/6: 429. Retrying in 1.0s...</text>
+      <text x="34" y="376">2026-08-03 14:02:15 INFO     transfer_product: [product 3/1248] winter-beanie</text>
+      <text x="34" y="398">2026-08-03 14:02:16 INFO     transfer_product: Updated existing product 'Winter Beanie' (id 8127349503456)</text>
+      <text x="34" y="420" fill="#7a7d84">...</text>
+      <text x="34" y="442">2026-08-03 14:03:47 INFO     transfer_product: [product 1248/1248] embroidered-cap</text>
+      <text x="34" y="464">2026-08-03 14:03:48 INFO     transfer_product: Created product 'Embroidered Cap' with ID 8127349519876</text>
+      <text x="34" y="486" fill="#22c08e">2026-08-03 14:03:48 INFO     transfer_product: Transfer complete: 1201 created, 47 updated, 0 failed</text>
+    </g>
+  </g>
+</svg>

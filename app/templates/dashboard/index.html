@@ -1,0 +1,213 @@
+{% extends "base.html" %}
+{% block title %}Dashboard{% endblock %}
+{% block content %}
+<h1>Migration dashboard</h1>
+
+<div class="card" id="no-connections-notice" style="display:none">
+  <p class="muted">You need at least two Shopify connections (a source and a destination) before you can run a migration.</p>
+  <a href="{{ url_for('connections.index') }}" class="btn btn-primary">Add a connection</a>
+</div>
+
+<div class="card" id="run-card">
+  <h2>Run a step</h2>
+  <p class="muted">Each step below runs its own script directly (e.g. selecting "products" runs <code>transfer.transfer_product</code>) with that script's own options -- only "all" runs the combined <code>transfer.transfer_all</code> pipeline.</p>
+  <form method="post" action="{{ url_for('dashboard.run') }}" onsubmit="return smwPrepareRunForm(this)">
+    <input type="hidden" name="source_connection_json" id="source-connection-json">
+    <input type="hidden" name="dest_connection_json" id="dest-connection-json">
+    <div class="row">
+      <div>
+        <label>Source store</label>
+        <select id="source-select"></select>
+      </div>
+      <div>
+        <label>Destination store</label>
+        <select id="dest-select"></select>
+      </div>
+    </div>
+
+    <label>Step</label>
+    <select name="step" id="step-select" onchange="smwToggleStepOptions()">
+      <option value="all">all (full migration)</option>
+      {% for s in steps %}
+      <option value="{{ s }}">{{ s }}</option>
+      {% endfor %}
+      {% for s in opt_in_steps %}
+      <option value="{{ s }}">{{ s }} (opt-in)</option>
+      {% endfor %}
+    </select>
+
+    <div style="margin-top: 12px">
+      <label><input type="checkbox" name="execute"> Execute (write to destination store) -- leave unchecked for a dry-run export only</label>
+    </div>
+
+    <div id="options-all" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook alongside each step's .json export</label>
+        <div class="row">
+          <div><label>Product limit (products step only)</label><input type="number" name="product_limit" min="1" placeholder="all"></div>
+          <div><label>Order limit (orders step only)</label><input type="number" name="order_limit" min="1" placeholder="all"></div>
+        </div>
+        <div class="row">
+          <div><label>Concurrent workers</label><input type="number" name="workers" min="1" placeholder="default"></div>
+          <div><label>Translations locale filter (comma-separated)</label><input type="text" name="translations_locale" placeholder="all published locales"></div>
+        </div>
+        <label><input type="checkbox" name="include_expired_discounts"> Include expired/disabled discounts</label>
+      </details>
+    </div>
+
+    <div id="options-products" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label>Single product handle or ID (leave blank to transfer every product)</label>
+        <input type="text" name="product_handle" placeholder="all products">
+        <div class="row">
+          <div><label>Limit (first N products)</label><input type="number" name="limit" min="1" placeholder="all"></div>
+          <div><label>Start at (0-indexed, resume a run)</label><input type="number" name="start_at" min="0" placeholder="0"></div>
+        </div>
+        <label>Concurrent workers</label>
+        <input type="number" name="workers" min="1" placeholder="default">
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-collections" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label>Single collection ID or handle (leave blank for every collection)</label>
+        <input type="text" name="collection" placeholder="all collections">
+        <div class="row">
+          <div><label>Initial limit (first N collections)</label><input type="number" name="initial_limit" min="1" placeholder="all"></div>
+          <div><label>Concurrent workers</label><input type="number" name="workers" min="1" placeholder="default"></div>
+        </div>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-orders" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <div class="row">
+          <div><label>Limit (first N orders)</label><input type="number" name="limit" min="1" placeholder="all"></div>
+          <div><label>Concurrent workers</label><input type="number" name="workers" min="1" placeholder="default"></div>
+        </div>
+        <label><input type="checkbox" name="replace_existing"> Replace existing orders on the destination (delete + recreate) instead of skipping</label>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-draft_orders" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <div class="row">
+          <div><label>Limit (first N draft orders)</label><input type="number" name="limit" min="1" placeholder="all"></div>
+          <div><label>Concurrent workers</label><input type="number" name="workers" min="1" placeholder="default"></div>
+        </div>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-discounts" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label><input type="checkbox" name="include_expired"> Also transfer expired/disabled discounts (off by default -- can be thousands of stale codes)</label>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-translations" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label>Locale filter (comma-separated, e.g. fr,de -- default: every published, non-primary destination locale)</label>
+        <input type="text" name="locale" placeholder="all published locales">
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-gift_cards" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label><input type="checkbox" name="confirm_gift_cards"> I understand this creates new gift cards with real redeemable balance on the destination store</label>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook</label>
+      </details>
+    </div>
+
+    <div id="options-theme" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label><input type="checkbox" name="theme_all"> Transfer every theme (ignores the fields below)</label>
+        <div class="row">
+          <div><label>Source theme ID (optional)</label><input type="text" name="theme_id" placeholder="MAIN theme by default"></div>
+          <div><label>Source theme role (if no theme ID given)</label><input type="text" name="theme_role" placeholder="MAIN"></div>
+        </div>
+        <label>Destination theme name (optional)</label>
+        <input type="text" name="theme_name" placeholder="'&lt;source name&gt; (migrated)'">
+        <label><input type="checkbox" name="publish"> Publish live after import</label>
+      </details>
+    </div>
+
+    <div id="options-generic" class="step-options" style="display:none">
+      <details class="advanced" open>
+        <summary>Options</summary>
+        <label><input type="checkbox" name="xlsx"> Also write an .xlsx workbook alongside the .json export</label>
+      </details>
+    </div>
+
+    <div style="margin-top: 16px">
+      <button type="submit" class="btn btn-primary">Run</button>
+    </div>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Recent jobs</h2>
+  <table>
+    <thead><tr><th>#</th><th>Label</th><th>Status</th><th>Started</th><th></th></tr></thead>
+    <tbody>
+    {% for j in recent_jobs %}
+    <tr>
+      <td>{{ j.id }}</td>
+      <td>{{ j.label }}</td>
+      <td><span class="badge badge-{{ j.status }}">{{ j.status }}</span></td>
+      <td class="muted">{{ j.started_at }}</td>
+      <td><a href="{{ url_for('jobs.detail', job_id=j.id) }}" class="btn btn-sm">View</a></td>
+    </tr>
+    {% else %}
+    <tr><td colspan="5" class="muted">No jobs yet.</td></tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+<script>
+var SMW_STEPS_WITH_OPTIONS = ['all', 'products', 'collections', 'orders', 'draft_orders', 'discounts', 'translations', 'gift_cards', 'theme'];
+
+function smwToggleStepOptions() {
+  var step = document.getElementById('step-select').value;
+  document.querySelectorAll('.step-options').forEach(function (el) { el.style.display = 'none'; });
+  var targetId = SMW_STEPS_WITH_OPTIONS.indexOf(step) !== -1 ? 'options-' + step : 'options-generic';
+  var target = document.getElementById(targetId);
+  if (target) target.style.display = 'block';
+}
+
+function smwPrepareRunForm(form) {
+  var srcSelect = document.getElementById('source-select');
+  var destSelect = document.getElementById('dest-select');
+  smwFillHiddenJson(srcSelect, document.getElementById('source-connection-json'));
+  smwFillHiddenJson(destSelect, document.getElementById('dest-connection-json'));
+  if (!srcSelect.value || !destSelect.value) {
+    alert('Add at least two Shopify connections first.');
+    return false;
+  }
+  return true;
+}
+
+(function () {
+  var shopifyConnections = smwConnectionsOfKind(['shopify']);
+  document.getElementById('no-connections-notice').style.display = shopifyConnections.length < 2 ? 'block' : 'none';
+  document.getElementById('run-card').style.display = shopifyConnections.length < 2 ? 'none' : 'block';
+  smwPopulateSelect(document.getElementById('source-select'), ['shopify']);
+  smwPopulateSelect(document.getElementById('dest-select'), ['shopify']);
+  smwToggleStepOptions();
+})();
+</script>
+{% endblock %}

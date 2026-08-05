@@ -1,0 +1,40 @@
+{% extends "base.html" %}
+{% block title %}Job #{{ job.id }}{% endblock %}
+{% block content %}
+<h1>Job #{{ job.id }}: {{ job.label }}</h1>
+<div class="card">
+  <p>
+    Status: <span id="status-badge" class="badge badge-{{ job.status }}">{{ job.status }}</span>
+    &nbsp; Module: <span class="muted">{{ job.module }}</span>
+  </p>
+  <p class="muted">Started {{ job.started_at }}{% if job.finished_at %} &middot; Finished {{ job.finished_at }}{% endif %}</p>
+  {% if job.status == 'running' %}
+  <form method="post" action="{{ url_for('jobs.kill', job_id=job.id) }}" onsubmit="return confirm('Kill this job?')">
+    <button type="submit" class="btn btn-danger">Kill job</button>
+  </form>
+  {% endif %}
+</div>
+<div class="card">
+  <h2>Log</h2>
+  <pre class="log" id="log">{{ log }}</pre>
+</div>
+<script>
+var jobId = {{ job.id }};
+var status = "{{ job.status }}";
+function poll() {
+  if (status !== 'running') return;
+  fetch('/jobs/' + jobId + '/status')
+    .then(function(r) { return r.json(); })
+    .then(function(data) {
+      document.getElementById('log').textContent = data.log;
+      var badge = document.getElementById('status-badge');
+      badge.textContent = data.status;
+      badge.className = 'badge badge-' + data.status;
+      status = data.status;
+      if (status === 'running') setTimeout(poll, 2000);
+    })
+    .catch(function() { setTimeout(poll, 4000); });
+}
+setTimeout(poll, 2000);
+</script>
+{% endblock %}
